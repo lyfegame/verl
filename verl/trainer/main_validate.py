@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Note that we don't combine the main with ray_trainer as ray_trainer is used by other main.
+Validation script for Excel manipulation tasks.
+Can run in validation-only mode or full training mode.
 """
 
 import hydra
@@ -22,12 +23,12 @@ from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.reward import load_reward_manager
 
 
-@hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
+@hydra.main(config_path="config", config_name="excel_ppo_trainer", version_base=None)
 def main(config):
-    run_ppo(config)
+    run_excel_validation(config)
 
 
-def run_ppo(config) -> None:
+def run_excel_validation(config) -> None:
     if not ray.is_initialized():
         # this is for local ray cluster
         ray.init(
@@ -51,7 +52,7 @@ class TaskRunner:
 
         pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
         OmegaConf.resolve(config)
-        
+
         # Check if validation-only mode
         validation_only = config.get("validation_only", False)
         if validation_only:
@@ -138,14 +139,19 @@ class TaskRunner:
         val_reward_fn = load_reward_manager(config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {}))
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
-        # Create datasets
-        from verl.utils.dataset.rl_dataset import collate_fn
-        train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor)
-        val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor)
-        
+        # Create datasets based on config
+        if config.data.get("use_excel_dataset", False):
+            from verl.utils.dataset.excel_dataset import ExcelTaskDataset, excel_collate_fn
+            train_dataset = ExcelTaskDataset(config.data.train_files, tokenizer, processor, config.data)
+            val_dataset = ExcelTaskDataset(config.data.val_files, tokenizer, processor, config.data)
+            collate_fn = excel_collate_fn
+        else:
+            from verl.utils.dataset.rl_dataset import collate_fn
+            train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor)
+            val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor)
+            
         train_sampler = create_rl_sampler(config.data, train_dataset)
         
-        print(f"[DEBUG] Creating RayPPOTrainer...")
         trainer = RayPPOTrainer(
             config=config,
             tokenizer=tokenizer,
@@ -161,24 +167,35 @@ class TaskRunner:
             train_sampler=train_sampler,
             device_name=config.trainer.device,
         )
-        print(f"[DEBUG] RayPPOTrainer created successfully")
         
-        print(f"[DEBUG] Calling trainer.init_workers()...")
         trainer.init_workers()
-        print(f"[DEBUG] trainer.init_workers() completed")
         
         if validation_only:
             # Run validation only
             print("\nRunning validation on the dataset...")
-            # Run initial validation
-            trainer._validate()
+            validation_results = trainer.validate()
             
-            print("\nValidation complete. Exiting without training.")
+            print("\n" + "=" * 80)
+            print("VALIDATION RESULTS:")
+            print("=" * 80)
+            print(f"Average Reward: {validation_results.get('val_reward', 0.0):.4f}")
+            print(f"Number of samples: {validation_results.get('num_samples', 0)}")
+            
+            # Print detailed results if available
+            if 'reward_extra_info' in validation_results:
+                print("\nDetailed Results:")
+                for task_id, info in validation_results['reward_extra_info'].items():
+                    print(f"\n{task_id}:")
+                    print(f"  Status: {info.get('status', 'unknown')}")
+                    if 'differences' in info:
+                        print(f"  Differences: {info['differences']}")
+                    if 'error' in info:
+                        print(f"  Error: {info['error']}")
+            
+            print("\nValidation complete. Exiting.")
         else:
             # Run full training
-            print(f"[DEBUG] Calling trainer.fit()...")
             trainer.fit()
-            print(f"[DEBUG] trainer.fit() completed")
 
 
 def create_rl_dataset(data_paths, data_config, tokenizer, processor):
@@ -241,4 +258,4 @@ def create_rl_sampler(data_config, dataset):
 
 
 if __name__ == "__main__":
-    main()
+    main() 

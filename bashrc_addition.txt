@@ -1,0 +1,33 @@
+# Add this to your ~/.bashrc for auto-activation of VERL environment
+# when entering the repository directory
+
+# VERL auto-activation function
+verl_auto_activate() {
+    local repo_path="/home/ubuntu/sharedusmidwest1/tianhangzhu/codev3/verltianhang"
+    
+    # Check if we're in the VERL repository directory or any subdirectory
+    if [[ "$PWD" == "$repo_path"* ]]; then
+        # Check if .venv exists in the repo
+        if [ -f "$repo_path/.venv/bin/activate" ]; then
+            # Check if we're not already in the venv
+            if [[ "$VIRTUAL_ENV" != "$repo_path/.venv" ]]; then
+                echo "🔄 Auto-activating VERL environment..."
+                source "$repo_path/.venv/bin/activate"
+                export PYTHONPATH="$repo_path:$PYTHONPATH"
+                echo "✅ VERL environment activated!"
+            fi
+        elif [ -f "$repo_path/activate_verl_env.sh" ]; then
+            # Fallback to activation script
+            source "$repo_path/activate_verl_env.sh"
+        fi
+    fi
+}
+
+# Override cd to check for VERL repo
+cd() {
+    builtin cd "$@"
+    verl_auto_activate
+}
+
+# Also check on shell startup
+verl_auto_activate 

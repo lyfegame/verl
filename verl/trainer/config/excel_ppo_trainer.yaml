@@ -1,0 +1,98 @@
+# Excel PPO Trainer Configuration
+# Can be used for both validation-only and full training modes
+
+defaults:
+  - _self_
+
+# Set to true for validation-only mode
+validation_only: false
+
+# Data configuration
+data:
+  use_excel_dataset: true  # Use the custom Excel dataset
+  train_files:
+    - /home/ubuntu/sharedusmidwest1/tianhangzhu/codev3/prototype-new-infra_ourtv1/evaluation/tasks/rm_data/merged_test83_72_data_noread_addr.jsonl
+  val_files:
+    - /home/ubuntu/sharedusmidwest1/tianhangzhu/codev3/prototype-new-infra_ourtv1/evaluation/tasks/rm_data/merged_test83_72_data_noread_addr.jsonl
+  
+  max_prompt_len: 4096
+  max_response_len: 2048
+  shuffle: true
+  seed: 42
+  trust_remote_code: true
+  
+  # For default dataset compatibility
+  reward_fn_key: reward
+
+# Custom reward function configuration
+custom_reward_function:
+  path: verl/utils/reward/excel_reward.py
+  name: excel_comparison_reward
+  reward_kwargs:
+    reward_batch_size: 32
+    max_workers: 8
+
+# Model configuration
+actor_rollout_ref:
+  model:
+    path: meta-llama/Llama-3-8b-hf  # Replace with your model path
+    use_shm: false
+    lora_rank: 0
+  
+  actor:
+    strategy: fsdp
+  
+  rollout:
+    name: vllm
+    mode: sync
+
+# Critic configuration
+critic:
+  strategy: fsdp
+  model:
+    path: meta-llama/Llama-3-8b-hf  # Same as actor or different
+
+# Reward model configuration
+reward_model:
+  enable: false  # We use custom reward function instead
+  reward_manager: naive
+  reward_kwargs: {}
+
+# Algorithm configuration
+algorithm:
+  use_kl_in_reward: false
+  kl_coeff: 0.1
+  clip_range: 0.2
+  value_clip: 0.2
+  gamma: 0.99
+  gae_lambda: 0.95
+  
+# Training configuration
+trainer:
+  nnodes: 1
+  n_gpus_per_node: 1
+  device: cuda
+  
+  # Training hyperparameters (ignored in validation-only mode)
+  num_epochs: 3
+  batch_size: 32
+  learning_rate: 1e-5
+  gradient_accumulation_steps: 1
+  
+  # Validation settings
+  validation_interval: 100
+  save_interval: 500
+  log_interval: 10
+  
+  # Output directory
+  output_dir: ./outputs/excel_validation
+
+# Ray configuration
+ray_init:
+  num_cpus: 8
+
+# Logging configuration
+wandb:
+  enabled: false
+  project: excel-validation
+  name: excel-task-validation 

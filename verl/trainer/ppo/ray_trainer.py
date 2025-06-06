@@ -104,15 +104,21 @@ class ResourcePoolManager:
     resource_pool_dict: dict[str, RayResourcePool] = field(default_factory=dict)
 
     def create_resource_pool(self):
+        print(f"[DEBUG] Creating resource pools...")
+        print(f"[DEBUG] Resource pool spec: {self.resource_pool_spec}")
         for resource_pool_name, process_on_nodes in self.resource_pool_spec.items():
+            print(f"[DEBUG] Creating resource pool '{resource_pool_name}' with process_on_nodes={process_on_nodes}")
             # max_colocate_count means the number of WorkerGroups (i.e. processes) in each RayResourcePool
             # For FSDP backend, we recommend using max_colocate_count=1 that merge all WorkerGroups into one.
             # For Megatron backend, we recommend using max_colocate_count>1
             # that can utilize different WorkerGroup for differnt models
             resource_pool = RayResourcePool(process_on_nodes=process_on_nodes, use_gpu=True, max_colocate_count=1, name_prefix=resource_pool_name)
+            print(f"[DEBUG] Resource pool '{resource_pool_name}' created successfully")
             self.resource_pool_dict[resource_pool_name] = resource_pool
 
+        print(f"[DEBUG] All resource pools created, checking resource availability...")
         self._check_resource_available()
+        print(f"[DEBUG] Resource availability check passed")
 
     def get_resource_pool(self, role: Role) -> RayResourcePool:
         """Get the resource pool of the worker_cls"""
@@ -769,12 +775,15 @@ class RayPPOTrainer:
         1. Ray resource pools from configuration
         2. Worker groups for each role (actor, critic, etc.)
         """
+        print(f"[DEBUG] Starting init_workers...")
         self.resource_pool_manager.create_resource_pool()
+        print(f"[DEBUG] Resource pools created")
 
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
         # create actor and rollout
         if self.hybrid_engine:
+            print(f"[DEBUG] Creating actor_rollout with hybrid engine...")
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
             actor_rollout_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[Role.ActorRollout],
@@ -782,68 +791,91 @@ class RayPPOTrainer:
                 role="actor_rollout",
             )
             self.resource_pool_to_cls[resource_pool]["actor_rollout"] = actor_rollout_cls
+            print(f"[DEBUG] Actor rollout class created")
         else:
             raise NotImplementedError
 
         # create critic
         if self.use_critic:
+            print(f"[DEBUG] Creating critic...")
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
             critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=self.config.critic)
             self.resource_pool_to_cls[resource_pool]["critic"] = critic_cls
+            print(f"[DEBUG] Critic class created")
 
         # create reference policy if needed
         if self.use_reference_policy:
+            print(f"[DEBUG] Creating reference policy...")
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
             ref_policy_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RefPolicy], config=self.config.actor_rollout_ref, role="ref")
             self.resource_pool_to_cls[resource_pool]["ref"] = ref_policy_cls
+            print(f"[DEBUG] Reference policy class created")
 
         # create a reward model if reward_fn is None
         if self.use_rm:
+            print(f"[DEBUG] Creating reward model...")
             # we create a RM here
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
             rm_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RewardModel], config=self.config.reward_model)
             self.resource_pool_to_cls[resource_pool]["rm"] = rm_cls
+            print(f"[DEBUG] Reward model class created")
 
         # initialize WorkerGroup
         # NOTE: if you want to use a different resource pool for each role, which can support different parallel size,
         # you should not use `create_colocated_worker_cls`.
         # Instead, directly pass different resource pool to different worker groups.
         # See https://github.com/volcengine/verl/blob/master/examples/ray/tutorial.ipynb for more information.
+        print(f"[DEBUG] Initializing worker groups...")
         all_wg = {}
         wg_kwargs = {}  # Setting up kwargs for RayWorkerGroup
         if OmegaConf.select(self.config.trainer, "ray_wait_register_center_timeout") is not None:
             wg_kwargs["ray_wait_register_center_timeout"] = self.config.trainer.ray_wait_register_center_timeout
 
         for resource_pool, class_dict in self.resource_pool_to_cls.items():
+            print(f"[DEBUG] Creating worker group for resource pool with classes: {list(class_dict.keys())}")
             worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
             wg_dict = self.ray_worker_group_cls(resource_pool=resource_pool, ray_cls_with_init=worker_dict_cls, device_name=self.device_name, **wg_kwargs)
+            print(f"[DEBUG] Spawning worker group...")
             spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
             all_wg.update(spawn_wg)
+            print(f"[DEBUG] Worker group spawned")
 
         if self.use_critic:
+            print(f"[DEBUG] Initializing critic model...")
             self.critic_wg = all_wg["critic"]
             self.critic_wg.init_model()
+            print(f"[DEBUG] Critic model initialized")
 
         if self.use_reference_policy and not self.ref_in_actor:
+            print(f"[DEBUG] Initializing reference policy model...")
             self.ref_policy_wg = all_wg["ref"]
             self.ref_policy_wg.init_model()
+            print(f"[DEBUG] Reference policy model initialized")
 
         if self.use_rm:
+            print(f"[DEBUG] Initializing reward model...")
             self.rm_wg = all_wg["rm"]
             self.rm_wg.init_model()
+            print(f"[DEBUG] Reward model initialized")
 
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
+        print(f"[DEBUG] Initializing actor rollout model...")
         self.actor_rollout_wg = all_wg["actor_rollout"]
         self.actor_rollout_wg.init_model()
+        print(f"[DEBUG] Actor rollout model initialized")
 
         # create async rollout manager and request scheduler
         self.async_rollout_mode = False
         if self.config.actor_rollout_ref.rollout.mode == "async":
+            print(f"[DEBUG] Setting up async rollout mode...")
             self.async_rollout_mode = True
             self.async_rollout_manager = AsyncLLMServerManager(
                 config=self.config.actor_rollout_ref,
                 worker_group=self.actor_rollout_wg,
             )
+            print(f"[DEBUG] Async rollout manager created")
+        
+        print(f"[DEBUG] init_workers completed")
 
     def _save_checkpoint(self):
         # path: given_path + `/global_step_{global_steps}` + `/actor`
@@ -879,7 +911,9 @@ class RayPPOTrainer:
             f.write(str(self.global_steps))
 
     def _load_checkpoint(self):
+        print(f"[DEBUG] _load_checkpoint called, resume_mode={self.config.trainer.resume_mode}")
         if self.config.trainer.resume_mode == "disable":
+            print(f"[DEBUG] Resume mode is disabled, returning 0")
             return 0
 
         # load from hdfs
@@ -890,7 +924,9 @@ class RayPPOTrainer:
             if not os.path.isabs(checkpoint_folder):
                 working_dir = os.getcwd()
                 checkpoint_folder = os.path.join(working_dir, checkpoint_folder)
+            print(f"[DEBUG] Looking for checkpoint in: {checkpoint_folder}")
             global_step_folder = find_latest_ckpt_path(checkpoint_folder)  # None if no latest
+            print(f"[DEBUG] Found latest checkpoint: {global_step_folder}")
 
         # find global_step_folder
         if self.config.trainer.resume_mode == "auto":
@@ -915,19 +951,27 @@ class RayPPOTrainer:
         actor_path = os.path.join(global_step_folder, "actor")
         critic_path = os.path.join(global_step_folder, "critic")
         # load actor
+        print(f"[DEBUG] Loading actor checkpoint from: {actor_path}")
         self.actor_rollout_wg.load_checkpoint(actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
+        print(f"[DEBUG] Actor checkpoint loaded")
         # load critic
         if self.use_critic:
+            print(f"[DEBUG] Loading critic checkpoint from: {critic_path}")
             self.critic_wg.load_checkpoint(critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
+            print(f"[DEBUG] Critic checkpoint loaded")
 
         # load dataloader,
         # TODO: from remote not implemented yet
         dataloader_local_path = os.path.join(global_step_folder, "data.pt")
         if os.path.exists(dataloader_local_path):
+            print(f"[DEBUG] Loading dataloader state from: {dataloader_local_path}")
             dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
             self.train_dataloader.load_state_dict(dataloader_state_dict)
+            print(f"[DEBUG] Dataloader state loaded")
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
+        
+        print(f"[DEBUG] _load_checkpoint completed, returning global_steps={self.global_steps}")
 
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen"):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
@@ -953,6 +997,8 @@ class RayPPOTrainer:
 
         from verl.utils.tracking import Tracking
 
+        print(f"[DEBUG] Starting fit() method")
+        
         logger = Tracking(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
@@ -963,30 +1009,45 @@ class RayPPOTrainer:
         self.global_steps = 0
 
         # load checkpoint before doing anything
+        print(f"[DEBUG] Loading checkpoint...")
         self._load_checkpoint()
+        print(f"[DEBUG] Checkpoint loaded, global_steps={self.global_steps}")
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+            print(f"[DEBUG] Starting initial validation...")
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
+            print(f"[DEBUG] Initial validation completed")
             if self.config.trainer.get("val_only", False):
+                print(f"[DEBUG] val_only=True, exiting...")
                 return
 
         # add tqdm
+        print(f"[DEBUG] Creating progress bar with total_training_steps={self.total_training_steps}, initial={self.global_steps}")
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
 
         # we start from step 1
         self.global_steps += 1
         last_val_metrics = None
 
+        print(f"[DEBUG] Starting training epochs, total_epochs={self.config.trainer.total_epochs}")
         for epoch in range(self.config.trainer.total_epochs):
+            print(f"[DEBUG] Starting epoch {epoch}")
+            batch_idx = 0
+            print(f"[DEBUG] About to iterate over train_dataloader, len={len(self.train_dataloader)}")
             for batch_dict in self.train_dataloader:
+                print(f"[DEBUG] Successfully retrieved batch_dict from dataloader")
+                print(f"[DEBUG] Processing batch {batch_idx} in epoch {epoch}, global_steps={self.global_steps}")
                 metrics = {}
                 timing_raw = {}
+                print(f"[DEBUG] Creating DataProto from batch_dict...")
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
+                print(f"[DEBUG] Batch created from dict, batch size: {len(batch.batch)}")
+                batch_idx += 1
 
                 # pop those keys for generation
                 batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
@@ -1001,20 +1062,27 @@ class RayPPOTrainer:
                     batch_keys=batch_keys_to_pop,
                     non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
                 )
+                print(f"[DEBUG] Generation batch prepared")
 
                 is_last_step = self.global_steps >= self.total_training_steps
 
                 with _timer("step", timing_raw):
                     # generate a batch
+                    print(f"[DEBUG] Starting generation phase...")
                     with _timer("gen", timing_raw):
                         if not self.async_rollout_mode:
+                            print(f"[DEBUG] Using sync rollout mode, calling generate_sequences...")
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                            print(f"[DEBUG] Generation completed successfully")
                         else:
+                            print(f"[DEBUG] Using async rollout mode...")
                             self.async_rollout_manager.wake_up()
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
                             self.async_rollout_manager.sleep()
+                            print(f"[DEBUG] Async generation completed")
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                        print(f"[DEBUG] Computing REMAX baseline...")
                         with _timer("gen_max", timing_raw):
                             gen_baseline_batch = deepcopy(gen_batch)
                             gen_baseline_batch.meta_info["do_sample"] = False
@@ -1029,6 +1097,7 @@ class RayPPOTrainer:
                             batch.batch["reward_baselines"] = reward_baseline_tensor
 
                             del gen_baseline_batch, gen_baseline_output
+                        print(f"[DEBUG] REMAX baseline computed")
 
                     batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
                     # repeat to align with repeated responses in rollout
@@ -1037,28 +1106,33 @@ class RayPPOTrainer:
 
                     batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.
-                    # NOTE: This usually changes the order of data in the `batch`,
-                    # which won't affect the advantage calculation (since it's based on uid),
-                    # but might affect the loss calculation (due to the change of mini-batching).
-                    # TODO: Decouple the DP balancing and mini-batching.
                     if self.config.trainer.balance_batch:
+                        print(f"[DEBUG] Balancing batch across DP ranks...")
                         self._balance_batch(batch, metrics=metrics)
+                        print(f"[DEBUG] Batch balancing completed")
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
+                    print(f"[DEBUG] Computing rewards...")
                     with _timer("reward", timing_raw):
                         # compute reward model score
                         if self.use_rm:
+                            print(f"[DEBUG] Computing RM scores...")
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
+                            print(f"[DEBUG] RM scores computed")
 
                         if self.config.reward_model.launch_reward_fn_async:
+                            print(f"[DEBUG] Launching async reward computation...")
                             future_reward = compute_reward_async.remote(batch, self.config, self.tokenizer)
                         else:
+                            print(f"[DEBUG] Computing rewards synchronously...")
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                            print(f"[DEBUG] Rewards computed")
 
                     # recompute old_log_probs
+                    print(f"[DEBUG] Computing old log probs...")
                     with _timer("old_log_prob", timing_raw):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                         entropys = old_log_prob.batch["entropys"]
@@ -1069,8 +1143,10 @@ class RayPPOTrainer:
                         metrics.update(old_log_prob_metrics)
                         old_log_prob.batch.pop("entropys")
                         batch = batch.union(old_log_prob)
+                        print(f"[DEBUG] Old log probs computed")
 
                         if "rollout_log_probs" in batch.batch.keys():
+                            print(f"[DEBUG] Computing rollout probs diff...")
                             # TODO: we may want to add diff of probs too.
                             rollout_old_log_probs = batch.batch["rollout_log_probs"]
                             actor_old_log_probs = batch.batch["old_log_probs"]
@@ -1096,24 +1172,33 @@ class RayPPOTrainer:
 
                     if self.use_reference_policy:
                         # compute reference log_prob
+                        print(f"[DEBUG] Computing reference log probs...")
                         with _timer("ref", timing_raw):
                             if not self.ref_in_actor:
+                                print(f"[DEBUG] Using separate reference policy...")
                                 ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
                             else:
+                                print(f"[DEBUG] Using actor as reference...")
                                 ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
+                            print(f"[DEBUG] Reference log probs computed")
 
                     # compute values
                     if self.use_critic:
+                        print(f"[DEBUG] Computing values...")
                         with _timer("values", timing_raw):
                             values = self.critic_wg.compute_values(batch)
                             batch = batch.union(values)
+                            print(f"[DEBUG] Values computed")
 
+                    print(f"[DEBUG] Computing advantages...")
                     with _timer("adv", timing_raw):
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
                         if self.config.reward_model.launch_reward_fn_async:
+                            print(f"[DEBUG] Getting async reward results...")
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+                            print(f"[DEBUG] Async reward results retrieved")
                         batch.batch["token_level_scores"] = reward_tensor
 
                         print(f"{list(reward_extra_infos_dict.keys())=}")
@@ -1122,13 +1207,14 @@ class RayPPOTrainer:
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
+                            print(f"[DEBUG] Applying KL penalty...")
                             batch, kl_metrics = apply_kl_penalty(batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty)
                             metrics.update(kl_metrics)
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
                         # compute advantages, executed on the driver process
-
+                        print(f"[DEBUG] Computing advantages with estimator={self.config.algorithm.adv_estimator}")
                         norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor
 
                         batch = compute_advantage(
@@ -1143,22 +1229,29 @@ class RayPPOTrainer:
                             pf_ppo_reweight_method=self.config.algorithm.pf_ppo.reweight_method,
                             pf_ppo_weight_pow=self.config.algorithm.pf_ppo.weight_pow,
                         )
+                        print(f"[DEBUG] Advantages computed")
 
                     # update critic
                     if self.use_critic:
+                        print(f"[DEBUG] Updating critic...")
                         with _timer("update_critic", timing_raw):
                             critic_output = self.critic_wg.update_critic(batch)
+                            print(f"[DEBUG] Critic updated")
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
+                        print(f"[DEBUG] Updating actor...")
                         with _timer("update_actor", timing_raw):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                             actor_output = self.actor_rollout_wg.update_actor(batch)
+                            print(f"[DEBUG] Actor updated")
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+                    else:
+                        print(f"[DEBUG] Skipping actor update due to critic warmup (step {self.global_steps} < {self.config.trainer.critic_warmup})")
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
