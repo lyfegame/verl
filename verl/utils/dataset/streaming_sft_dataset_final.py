@@ -271,3 +271,4 @@ if __name__ == "__main__":
         idx = random.randint(0, len(dataset) - 1)
         sample = dataset[idx]
         print(f"  Index {idx}: ✓ (shape: {sample['input_ids'].shape})")
+

@@ -149,7 +149,7 @@ class StreamingSFTDataset(Dataset):
                 continue
             
             # Step 2: Parallel indexing based on line numbers
-            if self.num_workers > 1 and line_count > 10000:
+            if self.num_workers > 1 and line_count > 1000:
                 # Split work by lines
                 print(f"    Parallel indexing with {self.num_workers} workers...")
                 file_offsets = self._parallel_index_file(file_path, line_count)
@@ -364,3 +364,4 @@ if __name__ == "__main__":
                   f"first tokens={sample['input_ids'][:5].tolist()}")
         
         del dataset
+

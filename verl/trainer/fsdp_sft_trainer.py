@@ -19,6 +19,7 @@ TODO(zhangchi.usc1992)
 """
 
 import os
+import sys
 
 os.environ["NCCL_DEBUG"] = "WARN"
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
@@ -46,7 +47,7 @@ import verl.utils.hdfs_io as hdfs_io
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, get_checkpoint_tracker_filename
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset
-from verl.utils.dataset.streaming_sft_dataset_final import StreamingSFTDataset as StreamingSFTDatasetV2
+from verl.utils.dataset.streaming_sft_dataset_v2 import StreamingSFTDataset as StreamingSFTDatasetV2
 from verl.utils.device import get_device_id, get_device_name, is_cuda_available, is_npu_available
 from verl.utils.distributed import destroy_global_process_group, initialize_global_process_group
 from verl.utils.fs import copy_to_local
@@ -82,8 +83,12 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_SFT_LOGGING_LEVEL", "WARN"))
 
 import subprocess
-import sys
 from pathlib import Path
+
+def print_flush(*args, **kwargs):
+    """Print with immediate flush to ensure visibility"""
+    print(*args, **kwargs)
+    sys.stdout.flush()
 
 
 def consolidate_fsdp_checkpoint(checkpoint_path: str) -> str:
@@ -519,6 +524,10 @@ class FSDPSFTTrainer:
             return loss
 
     def training_step(self, batch: TensorDict):
+        rank = self.device_mesh.get_rank()
+        if rank == 0:
+            print(f"[TRAIN_STEP] Starting training step")
+            
         self.fsdp_model.train()
 
         log_gpu_memory_usage("Before optimizer zero_grad", logger=logger)
@@ -529,11 +538,24 @@ class FSDPSFTTrainer:
 
         micro_batches = batch.split(self.config.data.micro_batch_size_per_gpu)
         n_micro_batches = len(micro_batches)
+        
+        if rank == 0:
+            print(f"[TRAIN_STEP] Processing {n_micro_batches} micro-batches")
+            
         step_loss = 0
-        for micro_batch in micro_batches:
+        for i, micro_batch in enumerate(micro_batches):
+            if rank == 0:
+                print(f"[MICRO_BATCH] Processing micro-batch {i+1}/{n_micro_batches}")
+                
             loss = self._compute_loss_and_backward(batch=micro_batch) / n_micro_batches
             step_loss += loss.item()
+            
+            if rank == 0:
+                print(f"[MICRO_BATCH] Micro-batch {i+1} loss: {loss.item():.4f}")
 
+        if rank == 0:
+            print(f"[TRAIN_STEP] Computing gradients and clipping")
+            
         if self.config.model.strategy == "fsdp":
             grad_norm = self.fsdp_model.clip_grad_norm_(max_norm=self.config.optim.clip_grad)
         elif self.config.model.strategy == "fsdp2":
@@ -541,13 +563,22 @@ class FSDPSFTTrainer:
         else:
             raise NotImplementedError(f"not implement {self.config.model.strategy}")
 
+        if rank == 0:
+            # Convert DTensor to scalar for formatting
+            grad_norm_scalar = grad_norm.item() if hasattr(grad_norm, 'item') else float(grad_norm)
+            print(f"[TRAIN_STEP] Grad norm: {grad_norm_scalar:.4f}")
+            
         log_gpu_memory_usage("Before optimizer step", logger=logger)
 
         # if grad_norm is not finite, skip the update
         if not torch.isfinite(grad_norm):
-            print(f"WARN: grad_norm is not finite: {grad_norm}")
+            # Convert DTensor to scalar for formatting
+            grad_norm_scalar = grad_norm.item() if hasattr(grad_norm, 'item') else float(grad_norm)
+            print(f"[WARN] Rank {rank}: grad_norm is not finite: {grad_norm_scalar}")
             self.optimizer.zero_grad()
         else:
+            if rank == 0:
+                print(f"[TRAIN_STEP] Executing optimizer step")
             self.optimizer.step()
 
         log_gpu_memory_usage("After optimizer step", logger=logger)
@@ -559,23 +590,44 @@ class FSDPSFTTrainer:
 
         log_gpu_memory_usage("After offload weights", logger=logger)
 
+        print(f"[TRAIN_STEP] Rank {rank}: Starting loss reduction across ranks")
+            
         step_loss = torch.tensor(step_loss).to(self.device_name)
+        
+        print(f"[TRAIN_STEP] Rank {rank}: Before all_reduce, local loss={step_loss.item():.4f}")
+        
         if is_cuda_available:
             torch.distributed.all_reduce(step_loss, op=torch.distributed.ReduceOp.AVG)
         elif is_npu_available:
             torch.distributed.all_reduce(step_loss)
             step_loss /= self.device_mesh.size(0)
+            
+        print(f"[TRAIN_STEP] Rank {rank}: After all_reduce, reduced loss={step_loss.item():.4f}")
+        
+        if rank == 0:
+            print(f"[TRAIN_STEP] Training step complete - Loss: {step_loss.item():.4f}, LR: {lr:.6f}")
+            
         return {"train/loss": step_loss.detach().item(), "train/lr(1e-3)": lr * 1e3}
 
     def validation_step(self, batch: TensorDict):
+        rank = self.device_mesh.get_rank()
+        if rank == 0:
+            print(f"[VAL_STEP] Starting validation step on rank {rank}")
+            
         self.fsdp_model.eval()
         with torch.no_grad():
             loss = self._compute_loss_and_backward(batch, do_backward=False)
+            
+            print(f"[VAL_STEP] Rank {rank}: Local validation loss before reduction: {loss.item():.4f}")
+            
             if is_cuda_available:
                 torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG)
             elif is_npu_available:
                 torch.distributed.all_reduce(loss)
                 loss /= self.device_mesh.size(0)
+                
+            if rank == 0:
+                print(f"[VAL_STEP] Rank {rank}: Validation loss after reduction: {loss.item():.4f}")
         return loss
 
     def save_checkpoint(self, step):
@@ -657,15 +709,19 @@ class FSDPSFTTrainer:
                             raise
 
                 # Synchronize before saving
+                print(f"[CHECKPOINT] Rank {self.device_mesh.get_rank()}: Waiting at pre-save barrier for step {step}")
                 torch.distributed.barrier()
+                print(f"[CHECKPOINT] Rank {self.device_mesh.get_rank()}: Passed pre-save barrier for step {step}")
 
                 # Get max checkpoints to keep
                 max_ckpt_to_keep = getattr(self.config.trainer, "max_ckpt_to_keep", None)
 
                 # Use checkpoint manager to save
+                print(f"[CHECKPOINT] Rank {self.device_mesh.get_rank()}: Starting checkpoint manager save for step {step}")
                 self.checkpoint_manager.save_checkpoint(
                     local_path=local_global_step_folder, global_step=step, max_ckpt_to_keep=max_ckpt_to_keep
                 )
+                print(f"[CHECKPOINT] Rank {self.device_mesh.get_rank()}: Checkpoint manager save completed for step {step}")
 
                 # Save dataloader state with permission handling
                 if self.device_mesh.get_rank() == 0:
@@ -732,14 +788,20 @@ class FSDPSFTTrainer:
                     except Exception as e:
                         print(f"Warning: Failed to copy to HDFS: {e}")
                         # Continue even if HDFS copy fails
+                
+                # Consolidate checkpoint
                 if self.device_mesh.get_rank() == 0:
+                    print(f"[CHECKPOINT] Starting FSDP consolidation for step {step}")
                     consolidate_fsdp_checkpoint(local_global_step_folder)
-                    
+                    print(f"[CHECKPOINT] FSDP consolidation completed for step {step}")
+                
+                print(f"[CHECKPOINT] Rank {self.device_mesh.get_rank()}: Waiting at post-save barrier for step {step}")
                 torch.distributed.barrier()
+                print(f"[CHECKPOINT] Rank {self.device_mesh.get_rank()}: Passed post-save barrier for step {step}")
                 
                 # Successfully saved checkpoint, break out of retry loop
                 if self.device_mesh.get_rank() == 0:
-                    print(f"Successfully saved checkpoint at step {step}")
+                    print(f"[CHECKPOINT] Successfully saved checkpoint at step {step}")
                 break
                 
             except TimeoutError as e:
@@ -969,49 +1031,74 @@ class FSDPSFTTrainer:
                 global_step += 1
                 
                 # Add detailed debug logging every N steps
-                if rank == 0 and (global_step == 1 or global_step % 10 == 0):
-                    print(f"[DEBUG] Processing step {global_step}/{self.total_training_steps}")
+                if global_step == 1 or global_step % 5 == 0:
+                    print(f"[TRAIN_LOOP] Rank {rank}: Processing step {global_step}/{self.total_training_steps}")
                     if torch.cuda.is_available():
                         allocated = torch.cuda.memory_allocated() / (1024**3)
                         reserved = torch.cuda.memory_reserved() / (1024**3)
-                        print(f"[DEBUG] GPU memory: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
+                        print(f"[TRAIN_LOOP] Rank {rank}: GPU memory: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
                 
+                print(f"[TRAIN_LOOP] Rank {rank}: Converting batch to TensorDict for step {global_step}")
                 data = TensorDict(data, batch_size=self.config.data.train_batch_size).to(self.device_name)
+                
+                print(f"[TRAIN_LOOP] Rank {rank}: Calling training_step for step {global_step}")
                 metric = self.training_step(data)
+                
+                print(f"[TRAIN_LOOP] Rank {rank}: Training step completed for step {global_step}")
+                
+                # Sync all ranks after each training step to ensure they're aligned
+                print(f"[TRAIN_LOOP] Rank {rank}: Waiting at post-training barrier for step {global_step}")
+                torch.distributed.barrier()
+                print(f"[TRAIN_LOOP] Rank {rank}: Passed post-training barrier for step {global_step}")
+                
                 if rank == 0:
                     tracking.log(data=metric, step=global_step)
-                    
-                    # Log metrics every N steps
-                    if global_step % 10 == 0:
-                        print(f"[DEBUG] Step {global_step} metrics: {metric}")
+                    print(f"[TRAIN_LOOP] Step {global_step} metrics logged: {metric}")
 
                 is_last_step = global_step >= self.total_training_steps
                 is_valid_step = global_step % self.config.trainer.test_freq == 0
                 is_save_step = global_step % self.config.trainer.save_freq == 0
+                
+                if rank == 0:
+                    print(f"[TRAIN_LOOP] Step {global_step} checks: is_last={is_last_step}, is_valid={is_valid_step}, is_save={is_save_step}")
 
                 # early exit or validation step
                 if is_last_step or (self.config.trainer.test_freq > 0 and is_valid_step):
+                    if rank == 0:
+                        print(f"[VALIDATION] Starting validation at step {global_step}")
                     # Perform validation
                     val_losses = []
-                    for val_data in self.val_dataloader:
+                    for val_idx, val_data in enumerate(self.val_dataloader):
+                        print(f"[VALIDATION] Rank {rank}: Processing validation batch {val_idx + 1}")
                         val_data = TensorDict(val_data, batch_size=self.config.data.micro_batch_size_per_gpu).to(
                             self.device_name
                         )
                         val_loss = self.validation_step(val_data)
                         val_losses.append(val_loss)
+                        
+                    print(f"[VALIDATION] Rank {rank}: Finished processing {len(val_losses)} validation batches")
+                    
                     if rank == 0:
                         val_loss = torch.mean(torch.stack(val_losses))
                         metric = {"val/loss": val_loss.detach().item()}
                         tracking.log(data=metric, step=global_step)
                         last_valid_metric = metric
+                        print(f"[VALIDATION] Final validation loss: {val_loss.detach().item():.4f}")
+                    
+                    print(f"[VALIDATION] Rank {rank}: Waiting at barrier after validation")
                     torch.distributed.barrier()
+                    print(f"[VALIDATION] Rank {rank}: Passed barrier after validation")
 
                 if is_last_step or (self.config.trainer.save_freq > 0 and is_save_step):
+                    if rank == 0:
+                        print(f"[CHECKPOINT] Starting checkpoint save at step {global_step}")
                     self.save_checkpoint(step=global_step)
+                    if rank == 0:
+                        print(f"[CHECKPOINT] Checkpoint save completed at step {global_step}")
 
                 if is_last_step:
                     if rank == 0:
-                        print(f"Final validation metrics: {last_valid_metric}")
+                        print(f"[TRAIN_LOOP] Training completed. Final validation metrics: {last_valid_metric}")
                     return
 
 
@@ -1093,8 +1180,8 @@ def create_sft_dataset(data_paths, data_config, tokenizer):
         num_workers = data_config.get('num_workers')
         print(f"[DEBUG] Using user-specified {num_workers} workers for dataset indexing")
     else:
-        # Auto-detect: use cpus-5 but cap at 32 for efficiency
-        num_workers = min(64, max(1, total_cpus - 5))  # Cap at 32, leave 5 CPUs free
+        # Auto-detect: use cpus-5 but cap at 64 for efficiency
+        num_workers = min(64, max(1, total_cpus - 5))  # Cap at 64, leave 5 CPUs free
         print(f"[DEBUG] System has {total_cpus} CPUs, auto-using {num_workers} workers for dataset indexing")
     
     # build dataset
