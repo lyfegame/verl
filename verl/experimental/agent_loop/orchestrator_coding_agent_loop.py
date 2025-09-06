@@ -58,8 +58,6 @@ def save_llm_interaction(messages, output_text, log_file_path=None):
     
     if log_file_path is None:
         if _current_log_file is None:
-            import time
-            import os
             # Create timestamped filename in ~/RLlog/ - once per run
             timestamp = int(time.time())
             log_dir = os.path.expanduser("~/RLlog")
@@ -68,7 +66,6 @@ def save_llm_interaction(messages, output_text, log_file_path=None):
         log_file_path = _current_log_file
     
     try:
-        import time
         interaction_data = {
             "timestamp": time.time(),
             "messages": messages,
@@ -261,23 +258,30 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
         
         # NEW: Oracle generation configuration
         cls.use_oracle_generation = config.actor_rollout_ref.rollout.multi_turn.get("use_oracle_generation", False)
-        cls.oracle_messages_file = config.actor_rollout_ref.rollout.multi_turn.get("oracle_messages_file", None)
-        cls.oracle_messages = []
+        cls.oracle_messages_file = config.actor_rollout_ref.rollout.multi_turn.get(
+            "oracle_messages_file",
+            "/home/tianhangzhu/gcs_view/home/tianhangzhu/verltrain/claude-code_v2/noninteractive_results_swe_gym_train_rest/bokeh__bokeh-12779/ipynbs_subleader/SWEB_2025-07-31T03-31-27-463Z_main_messages.json"
+        )
+        cls.oracle_messages = None
+        cls.oracle_assistant_index = 0
+        cls.oracle_user_index = 0
         
-        # Load oracle messages if oracle generation is enabled
-        if cls.use_oracle_generation and cls.oracle_messages_file:
-            try:
-                with open(cls.oracle_messages_file, 'r', encoding='utf-8') as f:
-                    oracle_data = json.load(f)
-                    cls.oracle_messages = oracle_data.get("messages", [])
-                    print(f"Loaded {len(cls.oracle_messages)} oracle messages from {cls.oracle_messages_file}")
-            except Exception as e:
-                print(f"Failed to load oracle messages: {e}")
-                cls.oracle_messages = []
+        # NEW: Oracle generation configuration
+        cls.use_oracle_generation = config.actor_rollout_ref.rollout.multi_turn.get("use_oracle_generation", False)
+        cls.oracle_messages_file = config.actor_rollout_ref.rollout.multi_turn.get(
+            "oracle_messages_file",
+            "/home/tianhangzhu/gcs_view/home/tianhangzhu/verltrain/claude-code_v2/noninteractive_results_swe_gym_train_rest/bokeh__bokeh-12779/ipynbs_subleader/SWEB_2025-07-31T03-31-27-463Z_main_messages.json"
+        )
+        cls.oracle_messages = None
+        cls.oracle_assistant_index = 0
+        cls.oracle_user_index = 0
         
+       
         print(f"Initialized Modal agent with base URL: {cls.modal_base_url}")
         if cls.use_oracle_generation:
-            print(f"Using Oracle generation: {cls.oracle_messages_file}")
+            print(f"Using Oracle generation from: {cls.oracle_messages_file}")
+            # Load oracle messages
+            cls._load_oracle_messages()
         elif cls.use_modal_endpoint:
             print(f"Using Modal endpoint for text generation: {cls.modal_chat_endpoint}")
         else:
@@ -303,10 +307,7 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
         # TOREVIEW (Shankha): Initialize truncation configuration for AST-based compaction
         cls.truncation_strategy = config.actor_rollout_ref.rollout.multi_turn.get("truncation_strategy", None)
         cls.truncation_max_tokens = config.actor_rollout_ref.rollout.multi_turn.get("truncation_max_tokens", 16000)
-        cls.enable_truncation = config.actor_rollout_ref.rollout.multi_turn.get("enable_truncation", False)
-        if cls.enable_truncation:
-            print(f"Truncation enabled with strategy: {cls.truncation_strategy}, max_tokens: {cls.truncation_max_tokens}")
-
+        cls.enable_truncation = True
         cls.apply_chat_template_kwargs = config.data.get("apply_chat_template_kwargs", {})
         cls.prompt_length = config.actor_rollout_ref.rollout.prompt_length
         cls.response_length = config.actor_rollout_ref.rollout.response_length
@@ -319,6 +320,28 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
         cls._cached_apply_chat_template = lru_cache(maxsize=1000)( # could probably make maxsize larger if you wanted
             cls._apply_chat_template_worker
         )
+    
+    @classmethod
+    def _load_oracle_messages(cls):
+        """Load oracle messages from JSON file"""
+        try:
+            with open(cls.oracle_messages_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                cls.oracle_messages = data.get("messages", [])
+                cls.oracle_assistant_index = 0
+                cls.oracle_user_index = 0
+                print(f"✅ Loaded {len(cls.oracle_messages)} oracle messages")
+                
+                # Filter messages for replay
+                assistant_messages = [msg for msg in cls.oracle_messages if msg.get("role") == "assistant"]
+                user_messages = [msg for msg in cls.oracle_messages if msg.get("role") == "user"]
+                print(f"✅ Found {len(assistant_messages)} assistant messages and {len(user_messages)} user messages to replay")
+                
+        except Exception as e:
+            logger.error(f"Failed to load oracle messages from {cls.oracle_messages_file}: {e}")
+            cls.oracle_messages = []
+            cls.oracle_assistant_index = 0
+            cls.oracle_user_index = 0
     
     @classmethod
     def _apply_chat_template_worker(cls, messages_tuple, processor_kwargs_tuple):
@@ -354,11 +377,48 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
                 request_data["top_logprobs"] = 5
             
             try:
+                # Log the request details for debugging
+                logger.info(f"Making Modal API request to: {self.modal_chat_endpoint}")
+                logger.info(f"Request data: {json.dumps(request_data, indent=2)}")
+                
                 response = await client.post(
                     self.modal_chat_endpoint,
                     json=request_data,
                     headers={"Content-Type": "application/json"}
                 )
+                
+                logger.info(f"Modal API response status: {response.status_code}")
+                logger.info(f"Modal API response headers: {dict(response.headers)}")
+                
+                # Capture response content BEFORE raise_for_status
+                response_content = None
+                try:
+                    response_content = response.content.decode('utf-8')
+                    logger.info(f"Modal API response content length: {len(response_content)} chars")
+                except Exception as decode_err:
+                    logger.error(f"Failed to decode response content: {decode_err}")
+                    response_content = str(response.content)
+                
+                # Try to parse JSON response content before checking status
+                response_json = None
+                if response_content:
+                    try:
+                        response_json = json.loads(response_content)
+                        logger.info(f"Modal API response JSON: {json.dumps(response_json, indent=2)}")
+                    except json.JSONDecodeError as json_err:
+                        logger.error(f"Response content is not valid JSON: {json_err}")
+                        logger.error(f"Raw response content: {response_content}")
+                
+                # Now check status and include response content in error
+                if response.status_code != 200:
+                    error_msg = f"HTTP {response.status_code} from Modal API"
+                    if response_json and 'error' in response_json:
+                        error_msg += f": {response_json['error']}"
+                    elif response_content:
+                        error_msg += f": {response_content[:500]}..."
+                    logger.error(error_msg)
+                    raise Exception(error_msg)
+                
                 response.raise_for_status()
                 
                 response_data = response.json()
@@ -393,87 +453,109 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
                 
             except Exception as e:
                 logger.error(f"Error calling Modal endpoint: {e}")
+                
+                # If it's an HTTP error, show detailed response information
+                if hasattr(e, 'response'):
+                    response = e.response
+                    logger.error(f"HTTP Response Status: {response.status_code}")
+                    logger.error(f"HTTP Response Headers: {dict(response.headers)}")
+                    
+                    # Capture and parse response content
+                    try:
+                        response_content = response.content.decode('utf-8')
+                        logger.error(f"HTTP Response Content ({len(response_content)} chars): {response_content}")
+                        
+                        # Try to parse as JSON to get structured error
+                        try:
+                            error_json = json.loads(response_content)
+                            logger.error(f"HTTP Response JSON Error: {json.dumps(error_json, indent=2)}")
+                        except json.JSONDecodeError:
+                            logger.error("HTTP Response is not valid JSON")
+                            
+                    except Exception as decode_err:
+                        logger.error(f"Failed to decode response content: {decode_err}")
+                        logger.error(f"HTTP Response Raw Content: {response.content}")
+                
                 # Fallback to empty response
                 return TokenOutput(token_ids=[], log_probs=None)
 
     async def _generate_with_oracle(self, messages, sampling_params, request_id):
-        """Generate text using Oracle messages (replay from file)"""
+        """Generate text using oracle messages (replay assistant responses)"""
         from verl.workers.rollout.async_server import TokenOutput
         
-        # Find the next assistant message from oracle
+        # Find next assistant message to replay
         assistant_messages = [msg for msg in self.oracle_messages if msg.get("role") == "assistant"]
         
-        if not assistant_messages:
-            logger.warning("No oracle assistant messages available")
+        if self.oracle_assistant_index >= len(assistant_messages):
+            logger.warning(f"Oracle assistant index {self.oracle_assistant_index} exceeds available assistant messages ({len(assistant_messages)})")
+            # Return empty response when we run out of oracle messages
             return TokenOutput(token_ids=[], log_probs=None)
         
-        # Use the first assistant message (simple replay strategy)
-        # TODO: Implement more sophisticated matching based on conversation context
-        oracle_message = assistant_messages[0]
-        response_text = oracle_message.get("content", "")
+        # Get the current assistant message to replay
+        current_message = assistant_messages[self.oracle_assistant_index]
+        self.oracle_assistant_index += 1
         
-        if isinstance(response_text, list):
-            # Handle structured content format
-            text_parts = []
-            for part in response_text:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    text_parts.append(part.get("text", ""))
-                elif isinstance(part, str):
-                    text_parts.append(part)
-            response_text = "".join(text_parts)
+        # Extract content from the message
+        content = current_message.get("content", "")
+        if isinstance(content, list):
+            # Handle structured content (like from Claude API)
+            text_content = ""
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    text_content += item.get("text", "")
+                elif isinstance(item, str):
+                    text_content += item
+            content = text_content
         
-        # Save LLM interaction to log file
-        save_llm_interaction(messages, response_text)
+        logger.info(f"Oracle replaying assistant message {self.oracle_assistant_index}/{len(assistant_messages)}")
+        logger.info(f"Oracle content preview: {content[:200]}...")
         
-        # Convert response text to token IDs
-        response_ids = self.tokenizer.encode(response_text, add_special_tokens=False)
+        # Save the oracle interaction for logging
+        save_llm_interaction(messages, content)
         
-        # Generate fake logprobs for oracle (all tokens get 0.5 logprob)
-        log_probs = [0.5] * len(response_ids) if sampling_params.get("logprobs") else None
+        # Tokenize the oracle response
+        response_ids = self.tokenizer.encode(content, add_special_tokens=False)
+        
+        # Generate dummy log probabilities (as requested: 0.5 for each token)
+        # Note: log_probs should be len(response_ids) - 1 if we exclude the first token
+        # But based on the user's comment, let's use len(response_ids) for now
+        log_probs = [0.5] * len(response_ids) if response_ids else None
+        
+        logger.info(f"Oracle generated {len(response_ids)} tokens with {len(log_probs) if log_probs else 0} log_probs")
         
         return TokenOutput(
             token_ids=response_ids,
             log_probs=log_probs
         )
-    
-    @classmethod
-    def _extract_code_blocks(cls, response: str) -> list[str]:
-        """Extract code from <code></code> blocks in the response.
+
+    def _get_next_oracle_user_message(self):
+        """Get the next user message from oracle for fake execution results"""
+        user_messages = [msg for msg in self.oracle_messages if msg.get("role") == "user"]
         
-        This properly handles nested <code> blocks using a stack-based approach.
-        """
-        extracted_blocks = []
-        i = 0
+        if self.oracle_user_index >= len(user_messages):
+            logger.warning(f"Oracle user index {self.oracle_user_index} exceeds available user messages ({len(user_messages)})")
+            return "Oracle user message not available"
         
-        while i < len(response):
-            if response[i:i+6] == '<code>':
-                opening_positions = [i + 6]
-                i += 6
-                inner_blocks = []
-                
-                while i < len(response) and opening_positions:
-                    if response[i:i+6] == '<code>':
-                        opening_positions.append(i + 6)
-                        i += 6
-                    elif response[i:i+7] == '</code>':
-                        if opening_positions:
-                            start = opening_positions.pop()
-                            content = response[start:i]
-                            
-                            if not opening_positions:
-                                extracted_blocks.append(content)
-                            else:
-                                inner_blocks.append(content)
-                        i += 7
-                    else:
-                        i += 1
-                
-                if opening_positions and inner_blocks:
-                    extracted_blocks.extend(inner_blocks)
-            else:
-                i += 1
+        # Get the current user message to use as fake execution result
+        current_message = user_messages[self.oracle_user_index]
+        self.oracle_user_index += 1
         
-        return [block.strip() for block in extracted_blocks if block.strip()]
+        # Extract content from the message
+        content = current_message.get("content", "")
+        if isinstance(content, list):
+            # Handle structured content (like from Claude API)
+            text_content = ""
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    text_content += item.get("text", "")
+                elif isinstance(item, str):
+                    text_content += item
+            content = text_content
+        
+        logger.info(f"Oracle using user message {self.oracle_user_index}/{len(user_messages)} as fake execution result")
+        logger.info(f"Oracle user content preview: {content[:200]}...")
+        
+        return content
 
     def extract_code_from_response(self, response: str) -> list[str]:
         """Extract code from <code></code> blocks in the response, return list of code blocks"""
@@ -594,13 +676,14 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
         
         # TOREVIEW (Shankha): Initialize HTTP client and sandbox
         async with httpx.AsyncClient(timeout=self.modal_timeout) as client:
-            # TOREVIEW (Shankha): Initialize the sandbox for this agent
-            endpoint_url = self._endpoint("init-sandbox") # 
-            logger.info(f"Calling Modal endpoint: {endpoint_url}")
-            
-            try:
+            if self.use_oracle_generation:
+                # ORACLE MODE: Skip sandbox initialization
+                sandbox_id = f"oracle_sandbox_{instance_id}"
+                logger.info(f"Oracle mode: Skipping sandbox initialization, using fake sandbox_id: {sandbox_id}")
+            else:
+                # NORMAL MODE: Initialize the sandbox for this agent
                 init_response = await client.post(
-                    endpoint_url,  # Modal function: init_sandbox
+                    self._endpoint("init-sandbox"),  # Modal function: init_sandbox
                     json={
                         "dataset": dataset_name,
                         "instance_id": instance_id,
@@ -609,61 +692,30 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
                         "model_endpoint": "verl",  # TODO: Get from config if needed
                         "truncation_strategy": self.truncation_strategy or "ast_llm_compaction",
                         "max_tokens": self.truncation_max_tokens,
-                        # Pass full_prompt and first_cell_code to trigger first-cell creation
-                        "full_prompt": full_prompt,
-                        "first_cell_code": first_cell_code
+                        # Pass task_prompt to trigger first-cell creation and prompt file write
+                        **{"full_prompt": full_prompt, "first_cell_code": first_cell_code}
                     }
                 )
-                
-                # Check HTTP status code first
-                if init_response.status_code != 200:
-                    error_msg = f"Modal API returned status {init_response.status_code}"
-                    try:
-                        error_detail = init_response.text
-                        error_msg += f": {error_detail}"
-                    except:
-                        pass
-                    logger.error(error_msg)
-                    raise RuntimeError(error_msg)
-                
-                # Check if response has content
-                if not init_response.content:
-                    logger.error("Modal API returned empty response")
-                    raise RuntimeError("Modal API returned empty response - service may be down or endpoint may be incorrect")
-                
-                # Try to parse JSON
-                try:
-                    init_data = init_response.json()
-                except json.JSONDecodeError as e:
-                    logger.error(f"Failed to parse Modal response as JSON: {e}")
-                    logger.error(f"Response content: {init_response.text[:500]}")  # Log first 500 chars
-                    raise RuntimeError(f"Modal API returned invalid JSON: {e}")
-                
-                # Handle both successful creation and existing sandbox cases
-                if init_data.get("success") or init_data.get("status") == "exists":
-                    # Sandbox either created successfully or already exists - both are OK
-                    if init_data.get("status") == "exists":
-                        logger.info(f"Reusing existing Modal sandbox: {init_data.get('sandbox_id')} for {instance_id}")
-                else:
+                init_data = init_response.json()
+                if not init_data.get("success"):
                     logger.error(f"Failed to initialize Modal sandbox: {init_data}")
                     # TODO: Decide how to handle initialization failure
                     raise RuntimeError(f"Failed to initialize Modal sandbox: {init_data}")
-                    
-            except httpx.RequestError as e:
-                logger.error(f"Network error calling Modal API: {e}")
-                raise RuntimeError(f"Failed to connect to Modal API at {endpoint_url}: {e}")
-            
-            sandbox_id = init_data.get("sandbox_id")
-            logger.info(f"Initialized Modal sandbox: {sandbox_id}")
+                
+                sandbox_id = init_data.get("sandbox_id")
+                logger.info(f"Initialized Modal sandbox: {sandbox_id}")
         
         # TOREVIEW (Shankha): Apply truncation to initial messages if needed
         # This handles cases where the initial prompt itself is too long
-        if self.enable_truncation:
+        # Skip truncation in oracle mode since we're replaying pre-recorded messages
+        if self.enable_truncation and not self.use_oracle_generation:
             initial_tokens = await self._tokenize_messages(messages)
             if len(initial_tokens) > self.truncation_max_tokens:
                 logger.info(f"Initial prompt too long ({len(initial_tokens)} tokens), applying truncation")
                 messages = await self._apply_truncation(messages)
                 conversation_messages = copy.deepcopy(messages)  # Update tracked messages
+        elif self.use_oracle_generation:
+            logger.info(f"Oracle mode: Skipping initial message truncation")
         
         if self.processor is not None:
             raw_prompt = await self.loop.run_in_executor(
@@ -695,35 +747,6 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
         user_turns, assistant_turns = 0, 0
         # TOREVIEW (Shankha): Re-open the client for the main loop
         async with httpx.AsyncClient(timeout=self.modal_timeout) as client:
-            # CRITICAL: Execute the first cell to set up the environment
-            # This sets up problem_statement, work_dir, and tool_definitions in the sandbox
-            if first_cell_code:
-                logger.info(f"Executing initial setup cell for {instance_id}")
-                try:
-                    exec_response = await client.post(
-                        self._endpoint("execute-cell"),
-                        json={
-                            "instance_id": instance_id,
-                            "run_id": run_id,
-                            "notebook_id": notebook_id,
-                            "cell_content": first_cell_code
-                        }
-                    )
-                    
-                    if exec_response.status_code == 200:
-                        exec_data = exec_response.json()
-                        if exec_data.get("success"):
-                            logger.info(f"Successfully executed initial setup cell")
-                            if exec_data.get("stdout"):
-                                logger.debug(f"Setup output: {exec_data['stdout'][:500]}")
-                        else:
-                            logger.error(f"Failed to execute setup cell: {exec_data.get('error')}")
-                    else:
-                        logger.error(f"Setup cell execution returned status {exec_response.status_code}")
-                        
-                except Exception as e:
-                    logger.error(f"Error executing initial setup cell: {e}")
-                    # Continue anyway - the model might still work without proper setup
             
             # TOREVIEW (Jeffrey): Process initial assistant messages to extract and execute code
             # Similar to leader_agent.py lines 507-531
@@ -767,7 +790,8 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
             while True:
                 # TOREVIEW (Shankha): Apply truncation before generation if enabled
                 # This ensures we don't exceed context limits during training
-                if self.enable_truncation and len(prompt_ids) > self.truncation_max_tokens:
+                # Skip truncation in oracle mode since we're replaying pre-recorded messages
+                if self.enable_truncation and not self.use_oracle_generation and len(prompt_ids) > self.truncation_max_tokens:
                     logger.info(f"Prompt length {len(prompt_ids)} exceeds truncation threshold, applying truncation")
                     
                     # Apply truncation to conversation messages
@@ -829,6 +853,8 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
                     # TOREVIEW (Shankha): After truncation, the model will regenerate responses
                     # with the compacted context, so log_probs will be consistent with the
                     # truncated prompt. This is the key insight from multi_turn_data_storage_correction.md
+                elif self.use_oracle_generation and len(prompt_ids) > self.truncation_max_tokens:
+                    logger.info(f"Oracle mode: Skipping truncation despite prompt length {len(prompt_ids)} > {self.truncation_max_tokens}")
                 
                 with simple_timer("generate_sequences", metrics):
                     if self.use_oracle_generation:
@@ -880,63 +906,64 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
                 # TOREVIEW (Jeffrey): Use proper extraction function that handles nested code blocks
                 code_blocks = self._extract_code_blocks(response_text)
                 if not code_blocks:
-                    break  # No code to execute
-
-                # TOREVIEW (Shankha): Execute code blocks (sequentially, as notebooks are stateful)
-                tool_responses = []
-                execution_errors = []  # Track actual exceptions
-                with simple_timer("code_execution", metrics):
-                    for code_block in code_blocks:
-                        try:
-                            # TOREVIEW (Shankha): Execute code via Modal API
-                            exec_response = await client.post(
-                                self._endpoint("execute-cell"),  # Modal function: execute_cell
-                                json={
-                                    "instance_id": instance_id,
-                                    "run_id": run_id,
-                                    "notebook_id": notebook_id,
-                                    "cell_content": code_block.strip()
-                                }
-                            )
-                            
-                            # Check status and parse response
-                            if exec_response.status_code != 200:
-                                logger.error(f"Modal execute-cell returned status {exec_response.status_code}")
-                                exec_data = {"success": False, "error": f"HTTP {exec_response.status_code}"}
-                            elif not exec_response.content:
-                                logger.error("Modal execute-cell returned empty response")
-                                exec_data = {"success": False, "error": "Empty response"}
-                            else:
-                                try:
+                    # No code to execute - break the loop
+                    logger.info("No code blocks found in response, ending loop")
+                    break
+                else:
+                    # TOREVIEW (Shankha): Execute code blocks (sequentially, as notebooks are stateful)
+                    tool_responses = []
+                    execution_errors = []  # Track actual exceptions
+                    with simple_timer("code_execution", metrics):
+                        for code_block in code_blocks:
+                            try:
+                                if self.use_oracle_generation:
+                                    # ORACLE MODE: Create fake execution results using oracle user messages
+                                    fake_stdout = self._get_next_oracle_user_message()
+                                    exec_data = {
+                                        "success": True,
+                                        "stdout": fake_stdout,
+                                        "stderr": "",
+                                        "error": None,
+                                        "terminated": False
+                                    }
+                                    logger.info(f"Oracle mode: Using fake execution result from user message")
+                                else:
+                                    # NORMAL MODE: Execute code via Modal API
+                                    exec_response = await client.post(
+                                        self._endpoint("execute-cell"),  # Modal function: execute_cell
+                                        json={
+                                            "instance_id": instance_id,
+                                            "run_id": run_id,
+                                            "notebook_id": notebook_id,
+                                            "cell_content": code_block.strip()
+                                        }
+                                    )
                                     exec_data = exec_response.json()
-                                except json.JSONDecodeError as e:
-                                    logger.error(f"Failed to parse execute-cell response: {e}")
-                                    exec_data = {"success": False, "error": f"Invalid JSON: {e}"}
                             
-                            # TOREVIEW (Jeffrey): Check for critical errors that should stop execution
-                            if exec_data.get("terminated", False):
-                                # Kernel died or critical error - stop execution
-                                logger.error(f"Kernel terminated during execution")
-                                execution_errors.append(Exception("Kernel terminated"))
-                                tool_responses.append(ToolResponse(text="Error: Kernel terminated during execution"))
-                                break
-                            
-                            # TOREVIEW (Jeffrey): Check execution result for termination condition (tool_calls == [])
-                            execution_model_output = self._extract_model_output_from_execution(exec_data)
-                            if execution_model_output and execution_model_output.get("tool_calls") == []:
-                                logger.info(f"Execution result returned empty tool_calls, ending loop")
-                                # Signal completion by setting a flag that will be checked after the code execution loop
-                                execution_errors.append("COMPLETION_SIGNAL")
-                                tool_responses.append(ToolResponse(text=f"Task completed: {execution_model_output}"))
-                                break
-                            
-                            # TOREVIEW (Shankha): Create a ToolResponse compatible object
-                            if exec_data.get("success"):
-                                output_text = ""
-                                if exec_data.get("stdout"):
-                                    output_text += exec_data["stdout"]
-                                if exec_data.get("stderr"):
-                                    output_text += f"\nSTDERR:\n{exec_data['stderr']}"
+                                # TOREVIEW (Jeffrey): Check for critical errors that should stop execution
+                                if exec_data.get("terminated", False):
+                                    # Kernel died or critical error - stop execution
+                                    logger.error(f"Kernel terminated during execution")
+                                    execution_errors.append(Exception("Kernel terminated"))
+                                    tool_responses.append(ToolResponse(text="Error: Kernel terminated during execution"))
+                                    break
+                                
+                                # TOREVIEW (Jeffrey): Check execution result for termination condition (tool_calls == [])
+                                execution_model_output = self._extract_model_output_from_execution(exec_data)
+                                if execution_model_output and execution_model_output.get("tool_calls") == []:
+                                    logger.info(f"Execution result returned empty tool_calls, ending loop")
+                                    # Signal completion by setting a flag that will be checked after the code execution loop
+                                    execution_errors.append("COMPLETION_SIGNAL")
+                                    tool_responses.append(ToolResponse(text=f"Task completed: {execution_model_output}"))
+                                    break
+                                
+                                # TOREVIEW (Shankha): Create a ToolResponse compatible object
+                                if exec_data.get("success"):
+                                    output_text = ""
+                                    if exec_data.get("stdout"):
+                                        output_text += exec_data["stdout"]
+                                    if exec_data.get("stderr"):
+                                        output_text += exec_data['stderr']
                                 
                                 # TOREVIEW (Shankha): Apply truncation if output is too long (matching original tool_agent_loop behavior)
                                 # TODO: Consider implementing custom truncation logic for notebook outputs
@@ -1069,76 +1096,58 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
         solution_metadata = {}
         
         async with httpx.AsyncClient(timeout=self.modal_timeout) as client:
-            # Step 1: Get solution patch
-            try:
-                # Call Modal endpoint to get solution patch
-                # This endpoint returns the git diff of changes made in the sandbox
-                solution_response = await client.post(
-                    self._endpoint("get-solution-patch"),  # Modal function: get_solution_patch
-                    json={
-                        "instance_id": instance_id,
-                        "run_id": run_id,
-                        "notebook_id": notebook_id
-                    }
-                )
-                
-                if solution_response.status_code == 200:
-                    if not solution_response.content:
-                        logger.warning("get-solution-patch returned empty response")
-                    else:
-                        try:
-                            solution_data = solution_response.json()
-                            if solution_data.get("success"):
-                                solution_patch = solution_data.get("patch", "")
-                                solution_metadata = solution_data.get("metadata", {})
-                                logger.info(f"Successfully extracted solution patch for {instance_id}")
-                                
-                                # Log the actual patch content for debugging
-                                if solution_patch:
-                                    patch_lines = solution_patch.split('\n')
-                                    logger.info(f"Solution patch preview for {instance_id} ({len(patch_lines)} lines):")
-                                    # Show first 10 and last 5 lines of the patch
-                                    if len(patch_lines) <= 15:
-                                        for line in patch_lines:
-                                            logger.info(f"  {line}")
-                                    else:
-                                        logger.info("  --- First 10 lines ---")
-                                        for line in patch_lines[:10]:
-                                            logger.info(f"  {line}")
-                                        logger.info(f"  ... ({len(patch_lines) - 15} lines omitted) ...")
-                                        logger.info("  --- Last 5 lines ---")
-                                        for line in patch_lines[-5:]:
-                                            logger.info(f"  {line}")
-                                else:
-                                    logger.warning(f"Empty solution patch extracted for {instance_id}")
-                            else:
-                                logger.warning(f"Failed to get solution: {solution_data}")
-                        except json.JSONDecodeError as e:
-                            logger.error(f"Failed to parse solution response: {e}")
-                else:
-                    logger.error(f"Solution extraction failed with status {solution_response.status_code}")
+            if self.use_oracle_generation:
+                # ORACLE MODE: Skip solution extraction and sandbox termination
+                solution_patch = "Oracle mode: No actual solution patch generated"
+                solution_metadata = {"oracle_mode": True, "instance_id": instance_id}
+                logger.info(f"Oracle mode: Skipping solution extraction and sandbox termination for {instance_id}")
+            else:
+                # NORMAL MODE: Extract solution and terminate sandbox
+                # Step 1: Get solution patch
+                try:
+                    # Call Modal endpoint to get solution patch
+                    # This endpoint returns the git diff of changes made in the sandbox
+                    solution_response = await client.post(
+                        self._endpoint("get-solution-patch"),  # Modal function: get_solution_patch
+                        json={
+                            "instance_id": instance_id,
+                            "run_id": run_id,
+                            "notebook_id": notebook_id
+                        }
+                    )
                     
-            except Exception as e:
-                logger.error(f"Error extracting solution: {e}")
-                # Continue with empty solution patch - reward computation will handle this
-            
-            # Step 2: Terminate sandbox (separate from solution extraction)
-            try:
-                terminate_response = await client.post(
-                    self._endpoint("terminate-sandbox"),  # Modal function: terminate_sandbox
-                    json={
-                        "instance_id": instance_id,
-                        "run_id": run_id,
-                        "notebook_id": notebook_id
-                    }
-                )
-                if terminate_response.status_code == 200:
-                    logger.info(f"Successfully terminated sandbox for {instance_id}")
-                else:
-                    logger.warning(f"Sandbox termination returned status {terminate_response.status_code}")
-            except Exception as e:
-                logger.error(f"Error terminating sandbox: {e}")
-                # Non-critical error - sandbox will eventually timeout
+                    if solution_response.status_code == 200:
+                        solution_data = solution_response.json()
+                        if solution_data.get("success"):
+                            solution_patch = solution_data.get("patch", "")
+                            solution_metadata = solution_data.get("metadata", {})
+                            logger.info(f"Successfully extracted solution patch for {instance_id}")
+                        else:
+                            logger.warning(f"Failed to get solution: {solution_data}")
+                    else:
+                        logger.error(f"Solution extraction failed with status {solution_response.status_code}")
+                        
+                except Exception as e:
+                    logger.error(f"Error extracting solution: {e}")
+                    # Continue with empty solution patch - reward computation will handle this
+                
+                # Step 2: Terminate sandbox (separate from solution extraction)
+                try:
+                    terminate_response = await client.post(
+                        self._endpoint("terminate-sandbox"),  # Modal function: terminate_sandbox
+                        json={
+                            "instance_id": instance_id,
+                            "run_id": run_id,
+                            "notebook_id": notebook_id
+                        }
+                    )
+                    if terminate_response.status_code == 200:
+                        logger.info(f"Successfully terminated sandbox for {instance_id}")
+                    else:
+                        logger.warning(f"Sandbox termination returned status {terminate_response.status_code}")
+                except Exception as e:
+                    logger.error(f"Error terminating sandbox: {e}")
+                    # Non-critical error - sandbox will eventually timeout
         
         # TOREVIEW (Jeffrey): Evaluate solution patch directly here
         # This is much simpler than passing it through the entire pipeline
