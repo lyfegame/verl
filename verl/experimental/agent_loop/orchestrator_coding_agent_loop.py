@@ -18,6 +18,7 @@ import logging
 import os
 import re  # Added for code block extraction
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -36,7 +37,158 @@ from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
 
 logger = logging.getLogger(__file__)
-logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+# Ensure logger outputs to console
+if not logger.handlers:
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+
+# Global variable to store the log file path for this run
+_current_log_file = None
+
+def save_llm_interaction(messages, output_text, log_file_path=None):
+    """Save LLM input messages and output to JSON file"""
+    global _current_log_file
+    
+    if log_file_path is None:
+        if _current_log_file is None:
+            import time
+            import os
+            # Create timestamped filename in ~/RLlog/ - once per run
+            timestamp = int(time.time())
+            log_dir = os.path.expanduser("~/RLlog")
+            os.makedirs(log_dir, exist_ok=True)
+            _current_log_file = os.path.join(log_dir, f"test_llm_{timestamp}.json")
+        log_file_path = _current_log_file
+    
+    try:
+        import time
+        interaction_data = {
+            "timestamp": time.time(),
+            "messages": messages,
+            "output": output_text
+        }
+        
+        # Ensure the directory exists
+        os.makedirs(os.path.dirname(log_file_path), exist_ok=True)
+        
+        # Read existing data if file exists
+        existing_data = []
+        if os.path.exists(log_file_path):
+            try:
+                with open(log_file_path, 'r', encoding='utf-8') as f:
+                    content = f.read().strip()
+                    if content:
+                        existing_data = json.loads(content)
+                        if not isinstance(existing_data, list):
+                            existing_data = [existing_data]
+            except (json.JSONDecodeError, IOError) as e:
+                logger.warning(f"Could not read existing log file: {e}")
+                existing_data = []
+        
+        # Append new data
+        existing_data.append(interaction_data)
+        
+        # Write back to file
+        with open(log_file_path, 'w', encoding='utf-8') as f:
+            json.dump(existing_data, f, indent=2, ensure_ascii=False)
+        
+        logger.info(f"Saved LLM interaction to {log_file_path}")
+    except Exception as e:
+        logger.error(f"Failed to save LLM interaction: {e}")
+
+
+def build_full_prompt_for_first_cell(task_prompt: str) -> tuple[str, str]:
+    """Build the full prompt exactly like run_leader_agent_swebench.py.
+    Returns (full_prompt_for_starting_txt, first_cell_source_code).
+    """
+    # 1) Load tool_definitions.json from the same location as SWE-bench runner
+    def _load_tool_definitions() -> list[dict]:
+        # Primary location: same directory as this file
+        tool_definitions_path = Path(__file__).parent / "tool_definitions.json"
+        #/home/tianhangzhu/RL/jeffery/verl/verl/experimental/agent_loop/orchestrator_coding_agent_loop.py
+        #/home/tianhangzhu/RL/jeffery/hierarchial_ppo_shankha/inference/tool_definitions.json
+        # Fallback locations if not found
+        candidates = [
+            tool_definitions_path,
+            Path(__file__).parent.parent.parent.parent.parent / "hierarchial_ppo_shankha" / "inference" / "tool_definitions.json",
+        ]
+        
+        for p in candidates:
+            try:
+                if p.exists():
+                    with open(p, 'r') as f:
+                        return json.load(f)
+            except Exception:
+                pass
+        
+        # Return empty list if not found (matching run_leader_agent_swebench.py behavior)
+        return []
+
+    def _convert_js_to_python(obj):
+        """Recursively convert JavaScript-style values to Python equivalents"""
+        if isinstance(obj, dict):
+            return {key: _convert_js_to_python(value) for key, value in obj.items()}
+        elif isinstance(obj, list):
+            return [_convert_js_to_python(item) for item in obj]
+        else:
+            # Handle boolean values - check both actual booleans and string representations
+            if obj is True:
+                return True
+            elif obj is False:
+                return False
+            elif obj is None:
+                return None
+            elif isinstance(obj, str):
+                obj_lower = obj.lower().strip()
+                if obj_lower == "false":
+                    return False
+                elif obj_lower == "true":
+                    return True
+                elif obj_lower == "null":
+                    return None
+            return obj
+
+    def _json_dumps_python_style(obj):
+        """JSON dumps that preserves Python boolean format"""
+        json_str = json.dumps(obj, indent=2)
+        # Replace JSON booleans with Python booleans
+        json_str = json_str.replace('"true"', 'True')
+        json_str = json_str.replace('"false"', 'False')
+        json_str = json_str.replace('"null"', 'None')
+        json_str = json_str.replace('true', 'True')
+        json_str = json_str.replace('false', 'False')
+        json_str = json_str.replace('null', 'None')
+        return json_str
+
+    # Convert tool definitions
+    tool_defs = _convert_js_to_python(_load_tool_definitions())
+    tool_def_str = _json_dumps_python_style(tool_defs)
+
+    # Double-JSON-dump for problem_statement (exactly as in run_leader_agent_swebench.py)
+    escaped_problem_statement = json.dumps(json.dumps(task_prompt))
+
+    # Create first cell source using triple-quoted f-string format (identical to run_leader_agent_swebench.py)
+    first_cell_source = f'''# Problem Statement and Configuration
+problem_statement = {escaped_problem_statement}
+
+work_dir = "/testbed"
+
+# Tool Definitions
+tool_definitions = {tool_def_str}'''
+
+    # Wrap the code in <code> tags
+    wrapped_code = f"<code>{first_cell_source}</code>"
+    
+    # Return the prompt in the expected format
+    full_prompt = f"<thinking>Please solve a PR request</thinking>{wrapped_code}"
+    
+    return full_prompt, first_cell_source
 
 
 @register("orchestrator_coding_agent")
@@ -69,6 +221,10 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
             return
         cls._class_initialized = True
         print("Performing class-level OrchestratorCodingAgentLoop initialization")
+        
+        # Reset the global log file for this new run
+        global _current_log_file
+        _current_log_file = None
 
         # TOREVIEW (Shankha): Initialize basic attributes
         cls.tokenizer = tokenizer
@@ -91,7 +247,23 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
         cls.modal_base_url = config.actor_rollout_ref.rollout.multi_turn.get("modal_base_url", "https://fairies--incremental-leader-agent-api")
         cls.modal_timeout = config.actor_rollout_ref.rollout.multi_turn.get("modal_timeout", 300)
         cls.code_pattern = re.compile(r'<code>(.*?)</code>', re.DOTALL)  # TOREVIEW (Shankha): Pattern to extract code blocks
+        
+        # NEW: Modal endpoint configuration for text generation
+        cls.use_modal_endpoint = config.actor_rollout_ref.rollout.multi_turn.get("use_modal_endpoint", False)
+        cls.modal_chat_endpoint = config.actor_rollout_ref.rollout.multi_turn.get(
+            "modal_chat_endpoint", 
+            "https://fairies--vllm-global-step-900-cons-7514578f-serve.modal.run/v1/chat/completions"
+        )
+        cls.modal_model_name = config.actor_rollout_ref.rollout.multi_turn.get(
+            "modal_model_name", 
+            "vllm-global-step-900-cons-7514578f"
+        )
+        
         print(f"Initialized Modal agent with base URL: {cls.modal_base_url}")
+        if cls.use_modal_endpoint:
+            print(f"Using Modal endpoint for text generation: {cls.modal_chat_endpoint}")
+        else:
+            print("Using server_manager for text generation")
 
         # Normalize modal endpoint helpers to avoid malformed hostnames
         def _compose_endpoint(path_suffix: str) -> str:
@@ -143,10 +315,150 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
             **processor_kwargs,
         )
 
+    async def _generate_with_modal_endpoint(self, messages, sampling_params, request_id):
+        """Generate text using Modal chat completion endpoint"""
+        from verl.workers.rollout.async_server import TokenOutput
+        
+        async with httpx.AsyncClient(timeout=self.modal_timeout) as client:
+            # Prepare OpenAI-compatible request
+            request_data = {
+                "model": self.modal_model_name,
+                "messages": messages,
+                "max_tokens": sampling_params.get("max_tokens", 100),
+                "temperature": sampling_params.get("temperature", 0.7),
+                "top_p": sampling_params.get("top_p", 1.0),
+                "stream": False
+            }
+            
+            # Add logprobs if requested
+            if sampling_params.get("logprobs"):
+                request_data["logprobs"] = True
+                request_data["top_logprobs"] = 5
+            
+            try:
+                response = await client.post(
+                    self.modal_chat_endpoint,
+                    json=request_data,
+                    headers={"Content-Type": "application/json"}
+                )
+                response.raise_for_status()
+                
+                response_data = response.json()
+                
+                # Extract response text
+                choice = response_data["choices"][0]
+                response_text = choice["message"]["content"]
+                
+                # Save LLM interaction to JSONL file
+                save_llm_interaction(messages, response_text)
+                
+                # Convert response text to token IDs
+                response_ids = self.tokenizer.encode(response_text, add_special_tokens=False)
+                
+                # Extract logprobs if available
+                log_probs = None
+                if sampling_params.get("logprobs") and "logprobs" in choice:
+                    log_probs = []
+                    if choice["logprobs"] and "content" in choice["logprobs"]:
+                        for token_info in choice["logprobs"]["content"]:
+                            log_probs.append(token_info.get("logprob", 0.0))
+                    
+                    # Ensure log_probs matches response_ids length
+                    while len(log_probs) < len(response_ids):
+                        log_probs.append(0.0)
+                    log_probs = log_probs[:len(response_ids)]
+                
+                return TokenOutput(
+                    token_ids=response_ids,
+                    log_probs=log_probs
+                )
+                
+            except Exception as e:
+                logger.error(f"Error calling Modal endpoint: {e}")
+                # Fallback to empty response
+                return TokenOutput(token_ids=[], log_probs=None)
+
+    def extract_code_from_response(self, response: str) -> list[str]:
+        """Extract code from <code></code> blocks in the response, return list of code blocks"""
+        extracted_blocks = []
+        i = 0
+        
+        while i < len(response):
+            if response[i:i+6] == '<code>':
+                opening_positions = [i + 6]
+                i += 6
+                inner_blocks = []
+                
+                while i < len(response) and opening_positions:
+                    if response[i:i+6] == '<code>':
+                        opening_positions.append(i + 6)
+                        i += 6
+                    elif response[i:i+7] == '</code>':
+                        if opening_positions:
+                            start = opening_positions.pop()
+                            content = response[start:i]
+                            
+                            if not opening_positions:
+                                extracted_blocks.append(content.strip())
+                            else:
+                                inner_blocks.append(content.strip())
+                        i += 7
+                    else:
+                        i += 1
+                
+                if opening_positions and inner_blocks:
+                    extracted_blocks.extend(inner_blocks)
+            else:
+                i += 1
+        
+        # Filter out empty blocks and return list
+        return [block for block in extracted_blocks if block.strip()]
+    def _extract_model_output_from_execution(self, exec_data: dict) -> dict:
+        """Extract model output from execution result stdout that contains 'LLM Response:\\n:{model_output}' format"""
+        try:
+            stdout = exec_data.get('stdout', '') 
+            stderr = exec_data.get('stderr', '')
+            if not stdout or stderr:
+                return None
+                
+            # Look for "LLM Response:" prefix and extract everything after it
+            llm_prefix = "LLM Response:"
+            if llm_prefix in stdout:
+                # Extract everything after "LLM Response:"
+                after_prefix = stdout.split(llm_prefix, 1)[1].strip()
+                
+                # Remove the leading ":" if present
+                if after_prefix.startswith(':'):
+                    after_prefix = after_prefix[1:].strip()
+                
+                # Stop at "Tool result message:" if it exists
+                tool_result_prefix = "Tool result message:"
+                if tool_result_prefix in after_prefix:
+                    after_prefix = after_prefix.split(tool_result_prefix, 1)[0].strip()
+                
+                # Try to parse as JSON
+                try:
+                    import json
+                    parsed = json.loads(after_prefix)
+                    logger.info(f"Found model output in execution result: {parsed}")
+                    return parsed
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Failed to parse execution result model output as JSON: {e}")
+                    logger.warning(f"Raw content after LLM Response: {repr(after_prefix)}")
+                    return None
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error extracting model output from execution: {e}")
+            return None
+
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         # Sandbox handles full prompt generation; default to empty if not provided
-        messages = list(kwargs.get("raw_prompt", [{"role": "user", "content": ""}]))
+        full_prompt, first_cell_code = build_full_prompt_for_first_cell(kwargs.get("task_prompt", ""))
+
+        messages = [{"role": "user", "content": full_prompt}]
         image_data = copy.deepcopy(kwargs.get("multi_modal_data", {}).get("image", None))
         metrics = {}
         request_id = uuid4().hex
@@ -186,7 +498,7 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
                     "truncation_strategy": self.truncation_strategy or "ast_llm_compaction",
                     "max_tokens": self.truncation_max_tokens,
                     # Pass task_prompt to trigger first-cell creation and prompt file write
-                    **({"task_prompt": task_prompt} if task_prompt else {})
+                    **{"full_prompt": full_prompt, "first_cell_code": first_cell_code}
                 }
             )
             init_data = init_response.json()
@@ -237,6 +549,46 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
         user_turns, assistant_turns = 0, 0
         # TOREVIEW (Shankha): Re-open the client for the main loop
         async with httpx.AsyncClient(timeout=self.modal_timeout) as client:
+            
+            # TOREVIEW (Jeffrey): Process initial assistant messages to extract and execute code
+            # Similar to leader_agent.py lines 507-531
+            logger.info("Processing initial assistant messages for code execution...")
+            logger.info(f"Total initial messages: {len(conversation_messages)}")
+            for i, msg in enumerate(conversation_messages):
+                logger.info(f"Message {i}: role='{msg.get('role')}', content_length={len(msg.get('content', ''))}")
+                if msg.get('role') == 'assistant' or (i == 0):
+                    logger.info(f"Processing message {i} for code extraction (role: {msg.get('role')})")
+                    # Extract code from assistant message content
+                    code_blocks = self.extract_code_from_response(msg.get('content', ''))
+                    logger.info(f"Extracted {len(code_blocks)} code blocks from message {i}")
+                    if code_blocks:
+                        logger.info(f"Found {len(code_blocks)} code block(s) in initial assistant message {i}, executing...")
+                        for j, code_block in enumerate(code_blocks):
+                            try:
+                                # Execute code via Modal API
+                                exec_response = await client.post(
+                                    self._endpoint("execute-cell"),
+                                    json={
+                                        "instance_id": instance_id,
+                                        "run_id": run_id,
+                                        "notebook_id": notebook_id,
+                                        "cell_content": code_block.strip()
+                                    }
+                                )
+                                exec_data = exec_response.json()
+                                
+                                logger.info(f"Initial message {i} code block {j+1} execution result: "
+                                          f"Success: {exec_data.get('success')}")
+                                if exec_data.get('stdout'):
+                                    logger.info(f"STDOUT: {exec_data['stdout'][:500]}...")  # Log first 500 chars
+                                if exec_data.get('stderr'):
+                                    logger.info(f"STDERR: {exec_data['stderr'][:500]}...")  # Log first 500 chars
+                                    
+                            except Exception as e:
+                                logger.error(f"Failed to execute code from initial assistant message {i}, block {j+1}: {e}")
+                    else:
+                        logger.info(f"No code found in initial assistant message {i}")
+            
             while True:
                 # TOREVIEW (Shankha): Apply truncation before generation if enabled
                 # This ensures we don't exceed context limits during training
@@ -295,9 +647,20 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
                     # truncated prompt. This is the key insight from multi_turn_data_storage_correction.md
                 
                 with simple_timer("generate_sequences", metrics):
-                    output = await self.server_manager.generate(
-                        request_id=request_id, prompt_ids=prompt_ids, sampling_params=sampling_params, image_data=image_data
-                    )
+                    if self.use_modal_endpoint:
+                        # Use Modal endpoint for generation
+                        output = await self._generate_with_modal_endpoint(
+                            conversation_messages, sampling_params, request_id
+                        )
+                    else:
+                        # Use traditional server_manager
+                        output = await self.server_manager.generate(
+                            request_id=request_id, prompt_ids=prompt_ids, sampling_params=sampling_params, image_data=image_data
+                        )
+                        # For server_manager, we need to decode the tokens to get the text output
+                        if output.token_ids:
+                            response_text = self.tokenizer.decode(output.token_ids, skip_special_tokens=True)
+                            save_llm_interaction(conversation_messages, response_text)
                 response_ids = output.token_ids
                 prompt_ids += response_ids
                 response_mask += [1] * len(response_ids)
@@ -305,16 +668,10 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
                     response_logprobs += output.log_probs
                 assistant_turns += 1
 
-                # reach max response length
-                if len(response_mask) >= self.response_length:
-                    break
-
-                # reach max assistant turns
-                if self.max_assistant_turns and assistant_turns >= self.max_assistant_turns:
-                    break
-
-                # reach max user turns
-                if self.max_user_turns and user_turns >= self.max_user_turns:
+                # reach max total turns (50) - only stop early if tool_calls == [] is detected in execution
+                total_turns = assistant_turns
+                if total_turns >= 50:
+                    logger.info(f"Reached maximum turns limit (50): assistant_turns={assistant_turns}, user_turns={user_turns}")
                     break
 
                 # TOREVIEW (Shankha): Extract code blocks instead of tool calls
@@ -325,73 +682,92 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
                 # TOREVIEW (Shankha): Update conversation messages with assistant response
                 conversation_messages.append({"role": "assistant", "content": response_text})
                 
-                code_blocks = self.code_pattern.findall(response_text)
+                code_blocks = self.extract_code_from_response(response_text)
                 if not code_blocks:
-                    break  # No code to execute
-
-                # TOREVIEW (Shankha): Execute code blocks (sequentially, as notebooks are stateful)
-                tool_responses = []
-                execution_errors = []  # Track actual exceptions
-                with simple_timer("code_execution", metrics):
-                    for code_block in code_blocks:
-                        try:
-                            # TOREVIEW (Shankha): Execute code via Modal API
-                            exec_response = await client.post(
-                                self._endpoint("execute-cell"),  # Modal function: execute_cell
-                                json={
-                                    "instance_id": instance_id,
-                                    "run_id": run_id,
-                                    "notebook_id": notebook_id,
-                                    "cell_content": code_block.strip()
-                                }
-                            )
-                            exec_data = exec_response.json()
-                            
-                            # TOREVIEW (Jeffrey): Check for critical errors that should stop execution
-                            if exec_data.get("terminated", False):
-                                # Kernel died or critical error - stop execution
-                                logger.error(f"Kernel terminated during execution")
-                                execution_errors.append(Exception("Kernel terminated"))
-                                tool_responses.append(ToolResponse(text="Error: Kernel terminated during execution"))
-                                break
-                            
-                            # TOREVIEW (Shankha): Create a ToolResponse compatible object
-                            if exec_data.get("success"):
-                                output_text = ""
-                                if exec_data.get("stdout"):
-                                    output_text += exec_data["stdout"]
-                                if exec_data.get("stderr"):
-                                    output_text += f"\nSTDERR:\n{exec_data['stderr']}"
-                                
-                                # TOREVIEW (Shankha): Apply truncation if output is too long (matching original tool_agent_loop behavior)
-                                # TODO: Consider implementing custom truncation logic for notebook outputs
-                                # For example: prioritize keeping error messages, truncate repetitive outputs differently,
-                                # or implement smart truncation that preserves data structure boundaries
-                                if output_text and len(output_text) > self.max_tool_response_length:
-                                    if self.tool_response_truncate_side == "left":
-                                        output_text = output_text[: self.max_tool_response_length] + "...(truncated)"
-                                    elif self.tool_response_truncate_side == "right":
-                                        output_text = "(truncated)..." + output_text[-self.max_tool_response_length:]
-                                    else:  # middle truncation
-                                        length = self.max_tool_response_length // 2
-                                        output_text = output_text[:length] + "...(truncated)..." + output_text[-length:]
-                                
-                                tool_response = ToolResponse(text=output_text.strip() if output_text else "Code executed successfully with no output.")
-                            else:
-                                error_msg = exec_data.get("error", "Unknown execution error")
-                                tool_response = ToolResponse(text=f"Error: {error_msg}")
-                            
-                            tool_responses.append(tool_response)
-                            
-                        except Exception as e:
-                            logger.error(f"Error executing code block: {e}")
-                            execution_errors.append(e)
-                            tool_responses.append(ToolResponse(text=f"Error executing code: {str(e)}"))
-                            
-                # TOREVIEW (Shankha): Break on critical execution errors
-                if execution_errors:
-                    logger.warning(f"Breaking due to {len(execution_errors)} execution errors")
+                    # No code to execute - break the loop
+                    logger.info("No code blocks found in response, ending loop")
                     break
+                else:
+                    # TOREVIEW (Shankha): Execute code blocks (sequentially, as notebooks are stateful)
+                    tool_responses = []
+                    execution_errors = []  # Track actual exceptions
+                    with simple_timer("code_execution", metrics):
+                        for code_block in code_blocks:
+                            try:
+                                # TOREVIEW (Shankha): Execute code via Modal API
+                                exec_response = await client.post(
+                                    self._endpoint("execute-cell"),  # Modal function: execute_cell
+                                    json={
+                                        "instance_id": instance_id,
+                                        "run_id": run_id,
+                                        "notebook_id": notebook_id,
+                                        "cell_content": code_block.strip()
+                                    }
+                                )
+                                exec_data = exec_response.json()
+                            
+                                # TOREVIEW (Jeffrey): Check for critical errors that should stop execution
+                                if exec_data.get("terminated", False):
+                                    # Kernel died or critical error - stop execution
+                                    logger.error(f"Kernel terminated during execution")
+                                    execution_errors.append(Exception("Kernel terminated"))
+                                    tool_responses.append(ToolResponse(text="Error: Kernel terminated during execution"))
+                                    break
+                                
+                                # TOREVIEW (Jeffrey): Check execution result for termination condition (tool_calls == [])
+                                execution_model_output = self._extract_model_output_from_execution(exec_data)
+                                if execution_model_output and execution_model_output.get("tool_calls") == []:
+                                    logger.info(f"Execution result returned empty tool_calls, ending loop")
+                                    # Signal completion by setting a flag that will be checked after the code execution loop
+                                    execution_errors.append("COMPLETION_SIGNAL")
+                                    tool_responses.append(ToolResponse(text=f"Task completed: {execution_model_output}"))
+                                    break
+                                
+                                # TOREVIEW (Shankha): Create a ToolResponse compatible object
+                                if exec_data.get("success"):
+                                    output_text = ""
+                                    if exec_data.get("stdout"):
+                                        output_text += exec_data["stdout"]
+                                    if exec_data.get("stderr"):
+                                        output_text += f"\nSTDERR:\n{exec_data['stderr']}"
+                                
+                                    # TOREVIEW (Shankha): Apply truncation if output is too long (matching original tool_agent_loop behavior)
+                                    # TODO: Consider implementing custom truncation logic for notebook outputs
+                                    # For example: prioritize keeping error messages, truncate repetitive outputs differently,
+                                    # or implement smart truncation that preserves data structure boundaries
+                                    if output_text and len(output_text) > self.max_tool_response_length:
+                                        if self.tool_response_truncate_side == "left":
+                                            output_text = output_text[: self.max_tool_response_length] + "...(truncated)"
+                                        elif self.tool_response_truncate_side == "right":
+                                            output_text = "(truncated)..." + output_text[-self.max_tool_response_length:]
+                                        else:  # middle truncation
+                                            length = self.max_tool_response_length // 2
+                                            output_text = output_text[:length] + "...(truncated)..." + output_text[-length:]
+                                
+                                    # Only create tool response if there's meaningful output
+                                    if output_text and output_text.strip():
+                                        tool_response = ToolResponse(text=output_text.strip())
+                                        tool_responses.append(tool_response)
+                                    # If no output, don't add any message to continue conversation
+                                else:
+                                    error_msg = exec_data.get("error", "Unknown execution error")
+                                    tool_response = ToolResponse(text=f"Error: {error_msg}")
+                                    tool_responses.append(tool_response)
+                            
+                            except Exception as e:
+                                logger.error(f"Error executing code block: {e}")
+                                execution_errors.append(e)
+                                tool_responses.append(ToolResponse(text=f"Error executing code: {str(e)}"))
+                            
+                # TOREVIEW (Shankha): Break on critical execution errors or completion signal
+                if execution_errors:
+                    # Check if this is a completion signal (tool_calls == [])
+                    if "COMPLETION_SIGNAL" in execution_errors:
+                        logger.info(f"Breaking due to completion signal (tool_calls == [])")
+                        break
+                    else:
+                        logger.warning(f"Breaking due to {len(execution_errors)} execution errors")
+                        break
 
                 # TOREVIEW (Shankha): Format tool responses as messages
                 tool_messages = []
@@ -403,6 +779,11 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
                 
                 # TOREVIEW (Shankha): Update conversation messages with tool responses
                 conversation_messages.extend(tool_messages)
+                
+                # Skip tokenization if no tool messages were generated
+                if not tool_messages:
+                    user_turns += 1
+                    continue
                     
                     # TOREVIEW (Shankha): Image/video handling commented out for now
                     # if tool_response.image or tool_response.video:
@@ -467,8 +848,7 @@ class OrchestratorCodingAgentLoop(AgentLoopBase):
 
                 # NOTE: last turn should not be user turn, or the EOS token reward
                 # can't be propagated to previous token in GAE.
-                if len(response_mask) + len(tool_response_ids) >= self.response_length:
-                    break
+                # Removed response length limit - only stop on meaningful conditions
 
                 prompt_ids += tool_response_ids
                 response_mask += [0] * len(tool_response_ids)
