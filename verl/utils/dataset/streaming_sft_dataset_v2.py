@@ -270,69 +270,39 @@ class StreamingSFTDataset(Dataset):
             data = json.loads(line.strip())
         except json.JSONDecodeError as e:
             # If parsing fails, try next item (same behavior as original)
-            print(f"Warning: Failed to parse line at index {item}: {e}")
-            return self.__getitem__((item + 1) % self.total_length)
-        
+            raise ValueError(f"Failed to parse line at index {item}: {e}")
         # Process pre-tokenized data
-        if 'input_ids' in data and 'loss_mask' in data:
-            input_ids = torch.tensor(data['input_ids'], dtype=torch.long)
-            loss_mask = torch.tensor(data['loss_mask'], dtype=torch.long)
-            
-            # Handle sequences longer than max_length
-            sequence_length = input_ids.shape[0]
-            
-            if sequence_length > self.max_length:
-                if self.truncation == 'error':
-                    raise ValueError(f'{sequence_length=} is larger than {self.max_length=}')
-                elif self.truncation == 'left':
-                    # Truncate from the left
-                    input_ids = input_ids[-self.max_length:]
-                    loss_mask = loss_mask[-self.max_length:]
-                else:  # right truncation
-                    # Truncate from the right
-                    input_ids = input_ids[:self.max_length]
-                    loss_mask = loss_mask[:self.max_length]
-                
-                sequence_length = self.max_length
-            
-            # Create attention mask (1 for real tokens)
-            attention_mask = torch.ones(sequence_length, dtype=torch.long)
-            
-            # Pad to max_length if needed (exact same as original SFTDataset)
-            if sequence_length < self.max_length:
-                pad_length = self.max_length - sequence_length
-                
-                # Pad input_ids with pad_token_id
-                padded_input_ids = torch.ones(pad_length, dtype=input_ids.dtype) * self.tokenizer.pad_token_id
-                input_ids = torch.cat((input_ids, padded_input_ids))
-                
-                # Pad attention_mask with zeros
-                padded_attention_mask = torch.zeros(pad_length, dtype=attention_mask.dtype)
-                attention_mask = torch.cat((attention_mask, padded_attention_mask))
-                
-                # Pad loss_mask with zeros
-                padded_loss_mask = torch.zeros(pad_length, dtype=loss_mask.dtype)
-                loss_mask = torch.cat((loss_mask, padded_loss_mask))
-            
-            # Compute position_ids from attention_mask (same as original)
-            position_ids = compute_position_id_with_mask(attention_mask)
-            
-            return {
-                'input_ids': input_ids,
-                'attention_mask': attention_mask,
-                'position_ids': position_ids,
-                'loss_mask': loss_mask
-            }
-        else:
-            # Data is not pre-tokenized, handle error gracefully
-            print(f"Warning: Sample {item} is not pre-tokenized (missing 'input_ids' or 'loss_mask')")
-            # Return a dummy sample with correct shape
-            return {
-                'input_ids': torch.ones(self.max_length, dtype=torch.long) * self.tokenizer.pad_token_id,
-                'attention_mask': torch.zeros(self.max_length, dtype=torch.long),
-                'position_ids': torch.zeros(self.max_length, dtype=torch.long),
-                'loss_mask': torch.zeros(self.max_length, dtype=torch.long)
-            }
+        assert 'input_ids' in data and 'loss_mask' in data, f"Missing 'input_ids' or 'loss_mask' in data: {data}"
+        
+        # If we're using the JSON data with pre-tokenized inputs
+        input_ids = torch.tensor(data['input_ids'], dtype=torch.long)
+        attention_mask = torch.ones_like(input_ids, dtype=torch.long)
+        loss_mask = torch.tensor(data['loss_mask'], dtype=torch.long)
+        
+        # Ensure the sequence is the right length
+
+        sequence_length = input_ids.shape[0]
+        assert sequence_length < self.max_length, f'{sequence_length=} is larger than {self.max_length=}'
+        
+        padded_input_ids = torch.ones(size=(self.max_length - sequence_length,),
+                                    dtype=input_ids.dtype) * self.tokenizer.pad_token_id
+        padded_attention_mask = torch.zeros(size=(self.max_length - sequence_length,), dtype=attention_mask.dtype)
+        padded_loss_mask = torch.zeros(size=(self.max_length - sequence_length,), dtype=attention_mask.dtype)
+
+        input_ids = torch.cat((input_ids, padded_input_ids))
+        attention_mask = torch.cat((attention_mask, padded_attention_mask))
+        loss_mask = torch.cat((loss_mask, padded_loss_mask))
+
+        position_ids = compute_position_id_with_mask(attention_mask)
+
+
+        return {
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+            'position_ids': position_ids,
+            'loss_mask': loss_mask
+        }
+       
 
     def __del__(self):
         """Clean up file handles when dataset is destroyed."""

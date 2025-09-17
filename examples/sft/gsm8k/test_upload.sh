@@ -1,3 +1,4 @@
+#!/bin/bash
 set -x
 conda activate verl
 export HYDRA_FULL_ERROR=1
@@ -148,9 +149,9 @@ nohup torchrun --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
     model.fsdp_config.model_dtype=bfloat16 \
     trainer.total_epochs=4 \
     model.enable_gradient_checkpointing=True \
-    trainer.save_freq=50 \
+    trainer.save_freq=2 \
     trainer.seed=11 \
-    trainer.test_freq=50 \
+    trainer.test_freq=10 \
     trainer.default_local_dir=$DISK_ROOT/output_new/$experiment_name \
     trainer.project_name=leadersftv4 \
     trainer.experiment_name=$experiment_name \

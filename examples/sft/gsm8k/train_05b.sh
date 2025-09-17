@@ -37,9 +37,9 @@ echo "========================================"
 
 nnodes=1
 nproc_per_node=8
-lr=2e-4
+lr=4e-4
 micro_batch_size_per_gpu=1
-train_batch_size=128
+train_batch_size=512
 
 # Validate that train_batch_size is divisible by (micro_batch_size_per_gpu * nproc_per_node)
 # This ensures that the number of micro batches per global step is an integer
@@ -68,13 +68,13 @@ echo "Added $ROOT_DIR/verl to PYTHONPATH"
 initial_model_path=Qwen/Qwen2.5-Coder-0.5B-Instruct
 
 # experiment_name=leadermodel14b_sft22k-lr-1e-4-trainbatch-32-astllmformatidentitymultiturn5xfixedsub10xrest-20250823-024202
-experiment_name=leadermodel05b_sft22k-lr-${lr}-trainbatch-${train_batch_size}-firstuserprioritydiverse-nosubagent267-allsamples
+experiment_name=leadermodel05b_sft22k-lr-${lr}-trainbatch-${train_batch_size}-firstuserprioritydiverse-allsuccess100xsystem
 # train_file=/home/tianhangzhu/gcs_view/home/tianhangzhu/data/sample_train_50.jsonl
 # test_file=/home/tianhangzhu/gcs_view/home/tianhangzhu/data/sample_test_50.jsonl
 # train_file=/home/tianhangzhu/gcs_view/home/tianhangzhu/data/noninteractive_results_swe_gym_train_rest_v2/ast_llm_output_max_tokens_20000_Noneconvs/leader_train_multiturn_fixedsub5xsub10xother.jsonl
 # test_file=/home/tianhangzhu/gcs_view/home/tianhangzhu/data/noninteractive_results_swe_gym_train_rest_v2/ast_llm_output_max_tokens_20000_Noneconvs/leader_test_multiturn_fixedsub5xsub10xother.jsonl
-train_file=/home/tianhangzhu/gcs_view/home/tianhangzhu/data/swegymrest_claude_sonnet_4_thinking_nonthinking_5settings_limit80_100default_v5/first_user_priority_output_max_tokens_20000_Noneconvs/leader_train_multiturn_10xsub35xother_optimized.jsonl
-test_file=/home/tianhangzhu/gcs_view/home/tianhangzhu/data/swegymrest_claude_sonnet_4_thinking_nonthinking_5settings_limit80_100default_v5/first_user_priority_output_max_tokens_20000_Noneconvs/leader_test_multiturn_10xsub35xother_optimized.jsonl
+train_file=/home/tianhangzhu/data2/leader_train_multiturn_sys100x_imp35x_impsub35x_firstmsg35x_optimized.jsonl
+test_file=/home/tianhangzhu/data2/leader_test_multiturn_sys100x_imp35x_impsub35x_firstmsg35x_optimized.jsonl
 # train_file=/home/tianhangzhu/gcs_view/home/tianhangzhu/data/noninteractive_results_swe_gym_train_rest_v2/first_user_priority_output_max_tokens_20000_Noneconvs//leader_train_multiturn_with_upsampling.jsonl
 # test_file=/home/tianhangzhu/gcs_view/home/tianhangzhu/data/noninteractive_results_swe_gym_train_rest_v2/first_user_priority_output_max_tokens_20000_Noneconvs//leader_test_multiturn_with_upsampling.jsonl
 # train_file=/home/tianhangzhu/gcs_view/home/tianhangzhu/data/noninteractive_results_swe_gym_train_rest_v2/ast_llm_output_max_tokens_20000_Noneconvs/leader_train_multiturn_fixedsub5xsub10xother.jsonl
@@ -146,11 +146,11 @@ nohup torchrun --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
     model.partial_pretrain=$initial_model_path \
     model.use_liger=True \
     model.fsdp_config.model_dtype=bfloat16 \
-    trainer.total_epochs=4 \
+    trainer.total_epochs=8 \
     model.enable_gradient_checkpointing=True \
-    trainer.save_freq=50 \
+    trainer.save_freq=100 \
     trainer.seed=11 \
-    trainer.test_freq=50 \
+    trainer.test_freq=100 \
     trainer.default_local_dir=$DISK_ROOT/output_new/$experiment_name \
     trainer.project_name=leadersftv4 \
     trainer.experiment_name=$experiment_name \

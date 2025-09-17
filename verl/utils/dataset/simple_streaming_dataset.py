@@ -1,194 +1,243 @@
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """
-Simple streaming dataset that doesn't build an index upfront.
-Just seeks to the approximate position and reads from there.
+SFT dataset
+- We assume user pass a single parquet file.
+- We load all the data into the memory.
+Each parquet file contains
 """
 
+from typing import List, Union
 import json
+import pandas as pd
+import multiprocessing as mp
+from multiprocessing import Pool
+from functools import partial
 import os
-from typing import List, Union, Optional, Dict, Any
-from torch.utils.data import Dataset, IterableDataset
+import mmap
+import io
+
 import torch
+from torch.utils.data import Dataset
+from transformers import AutoTokenizer, PreTrainedTokenizer
+
+from verl.utils.fs import copy_to_local
+from verl.utils.model import compute_position_id_with_mask
+from verl.utils import hf_tokenizer
 
 
-class SimpleStreamingDataset(IterableDataset):
+def load_file_chunk_simple(args):
     """
-    A truly streaming dataset that doesn't load anything upfront.
-    This uses IterableDataset which is better suited for streaming large files.
+    Simple and robust helper function to load a chunk of lines from a file.
+    Uses line-based chunking which is more reliable than byte-based chunking.
     """
+    file_path, start_line, end_line = args
+    data_chunk = []
     
-    def __init__(
-        self,
-        parquet_files: Union[str, List[str]],
-        tokenizer=None,  # Not used for pre-tokenized data
-        config: Optional[Dict[str, Any]] = None
-    ):
-        """
-        Initialize the streaming dataset.
-        
-        Args:
-            parquet_files: Path(s) to JSONL files
-            tokenizer: Not used for pre-tokenized data
-            config: Configuration dictionary
-        """
-        config = config or {}
-        self.max_length = config.get("max_length", 22000)
-        self.truncation = config.get("truncation", "right")
-        
-        if not isinstance(parquet_files, list):
-            parquet_files = [parquet_files]
-        
-        self.files = parquet_files
-        print(f"SimpleStreamingDataset initialized with {len(self.files)} file(s)")
-        
-    def __iter__(self):
-        """Iterate through all files and yield samples."""
-        for file_path in self.files:
-            print(f"Streaming from: {file_path}")
-            with open(file_path, 'r') as f:
-                for line_num, line in enumerate(f):
-                    if line_num % 1000 == 0:
-                        print(f"  Processed {line_num} samples...", end='\r')
-                    
-                    line = line.strip()
-                    if not line:
-                        continue
-                    
-                    try:
-                        data = json.loads(line)
-                        
-                        # Handle pre-tokenized data
-                        if 'input_ids' in data and 'loss_mask' in data:
-                            input_ids = torch.tensor(data['input_ids'], dtype=torch.long)
-                            loss_mask = torch.tensor(data['loss_mask'], dtype=torch.bool)
-                            
-                            # Apply truncation if needed
-                            if len(input_ids) > self.max_length:
-                                if self.truncation == 'error':
-                                    print(f"Warning: Sequence length {len(input_ids)} exceeds max_length {self.max_length}, skipping")
-                                    continue
-                                elif self.truncation == 'left':
-                                    input_ids = input_ids[-self.max_length:]
-                                    loss_mask = loss_mask[-self.max_length:]
-                                else:  # right
-                                    input_ids = input_ids[:self.max_length]
-                                    loss_mask = loss_mask[:self.max_length]
-                            
-                            yield {
-                                'input_ids': input_ids,
-                                'loss_mask': loss_mask
-                            }
-                        else:
-                            # Skip non-tokenized data for now
-                            continue
-                            
-                    except json.JSONDecodeError as e:
-                        print(f"Error parsing JSON at line {line_num}: {e}")
-                        continue
-
-
-class IndexedStreamingDataset(Dataset):
-    """
-    A compromise between full streaming and full loading.
-    Only counts lines upfront (much faster than building full index).
-    Then seeks to approximate positions when needed.
-    """
-    
-    def __init__(
-        self,
-        parquet_files: Union[str, List[str]],
-        tokenizer=None,
-        config: Optional[Dict[str, Any]] = None
-    ):
-        config = config or {}
-        self.max_length = config.get("max_length", 22000)
-        self.truncation = config.get("truncation", "right")
-        
-        if not isinstance(parquet_files, list):
-            parquet_files = [parquet_files]
-        
-        self.files = parquet_files
-        self.file_handles = []
-        self.file_lengths = []
-        self.cumulative_lengths = [0]
-        
-        print(f"IndexedStreamingDataset: Counting lines in {len(self.files)} file(s)...")
-        
-        # Just count lines - much faster than building full index
-        for file_path in self.files:
-            print(f"  Counting lines in {file_path}...")
-            line_count = 0
-            with open(file_path, 'r') as f:
-                for _ in f:
-                    line_count += 1
-            
-            self.file_lengths.append(line_count)
-            self.cumulative_lengths.append(self.cumulative_lengths[-1] + line_count)
-            print(f"    Found {line_count:,} lines")
-        
-        self.total_length = self.cumulative_lengths[-1]
-        print(f"Total dataset size: {self.total_length:,} samples")
-    
-    def __len__(self):
-        return self.total_length
-    
-    def __getitem__(self, idx):
-        """Get a specific sample by index."""
-        if idx >= self.total_length:
-            raise IndexError(f"Index {idx} out of range")
-        
-        # Find which file
-        file_idx = 0
-        for i in range(len(self.cumulative_lengths) - 1):
-            if self.cumulative_lengths[i] <= idx < self.cumulative_lengths[i + 1]:
-                file_idx = i
+    with open(file_path, 'r', buffering=8192*4) as f:  # Use larger buffer for better I/O performance
+        for i, line in enumerate(f):
+            if i < start_line:
+                continue
+            if end_line is not None and i >= end_line:
                 break
+            
+            line = line.strip()
+            if line:
+                try:
+                    data_chunk.append(json.loads(line))
+                except json.JSONDecodeError:
+                    # Skip malformed JSON lines
+                    continue
+    
+    return data_chunk
+
+
+def count_lines_fast(file_path):
+    """Count lines in a file efficiently using buffered reading."""
+    line_count = 0
+    with open(file_path, 'rb', buffering=8192*8) as f:
+        buffer = f.read(8192*8)
+        while buffer:
+            line_count += buffer.count(b'\n')
+            buffer = f.read(8192*8)
+    return line_count
+
+
+class SFTDataset(Dataset):
+    """
+    This is an in-memory SFTDataset
+    """
+
+    def __init__(self,
+                 parquet_files: Union[str, List[str]],
+                 tokenizer,
+                 prompt_key='prompt',
+                 prompt_dict_keys=None,
+                 response_key='response',
+                 response_dict_keys=None,
+                 max_length=1024,
+                 truncation='error'):
+        assert truncation in ['error', 'left', 'right']
+        self.truncation = truncation
+
+        if not isinstance(parquet_files, List):
+            parquet_files = [parquet_files]
+
+        self.parquet_files = parquet_files
+        if isinstance(tokenizer, str):
+            tokenizer = hf_tokenizer(tokenizer)
+        self.tokenizer: PreTrainedTokenizer = tokenizer
+
+        self.prompt_key = prompt_key
+        self.response_key = response_key
+        self.max_length = max_length
+
+        self._read_files_and_tokenize()
+
+    def _read_files_and_tokenize_parallel(self, num_workers=None):
+        """
+        Optimized parallel version of _read_files_and_tokenize using line-based chunking.
+        This version uses efficient line counting and larger I/O buffers for better performance.
+        """
+        if num_workers is None:
+            num_workers = min(mp.cpu_count(), 4)  # Use at most 4 workers by default
         
-        # Calculate line number within file
-        line_idx = idx - self.cumulative_lengths[file_idx]
+        print(f"Loading data using {num_workers} workers (optimized)...")
         
-        # Read the specific line
-        with open(self.files[file_idx], 'r') as f:
-            for i, line in enumerate(f):
-                if i == line_idx:
+        all_data = []
+        
+        for file_path in self.parquet_files:
+            # Count total lines efficiently
+            total_lines = count_lines_fast(file_path)
+            print(f"File {file_path} has {total_lines} lines")
+            
+            if total_lines == 0:
+                continue
+            
+            # Calculate line ranges for each worker
+            lines_per_worker = max(1, total_lines // num_workers)
+            
+            # Create chunks for parallel processing
+            chunks = []
+            for i in range(num_workers):
+                start_line = i * lines_per_worker
+                if i == num_workers - 1:  # Last worker takes remaining lines
+                    end_line = total_lines
+                else:
+                    end_line = (i + 1) * lines_per_worker
+                
+                if start_line < total_lines:
+                    chunks.append((file_path, start_line, end_line))
+            
+            print(f"Created {len(chunks)} chunks for parallel processing")
+            
+            # Process chunks in parallel
+            with Pool(num_workers) as pool:
+                chunk_results = pool.map(load_file_chunk_simple, chunks)
+            
+            # Combine results from all chunks
+            for chunk_data in chunk_results:
+                all_data.extend(chunk_data)
+        
+        print(f"Loaded {len(all_data)} items using optimized parallel processing")
+        
+        self.data = all_data
+        self.input_ids = []
+        self.loss_masks = []
+        
+        for item in all_data:
+            self.input_ids.append(item['input_ids'])
+            self.loss_masks.append(item['loss_mask'])
+        
+        return
+
+    def _read_files_and_tokenize(self):
+        # Load JSONL data
+        data = []
+        for file_path in self.parquet_files:
+            with open(file_path, 'r') as f:
+                for line in f:
                     line = line.strip()
-                    if not line:
-                        return self.__getitem__((idx + 1) % self.total_length)
-                    
-                    try:
-                        data = json.loads(line)
-                        
-                        if 'input_ids' in data and 'loss_mask' in data:
-                            input_ids = torch.tensor(data['input_ids'], dtype=torch.long)
-                            loss_mask = torch.tensor(data['loss_mask'], dtype=torch.bool)
-                            
-                            # Apply truncation
-                            if len(input_ids) > self.max_length:
-                                if self.truncation == 'error':
-                                    raise ValueError(f"Sequence too long: {len(input_ids)}")
-                                elif self.truncation == 'left':
-                                    input_ids = input_ids[-self.max_length:]
-                                    loss_mask = loss_mask[-self.max_length:]
-                                else:
-                                    input_ids = input_ids[:self.max_length]
-                                    loss_mask = loss_mask[:self.max_length]
-                            
-                            return {
-                                'input_ids': input_ids,
-                                'loss_mask': loss_mask
-                            }
-                        else:
-                            # Return empty sample if not pre-tokenized
-                            return {
-                                'input_ids': torch.zeros(1, dtype=torch.long),
-                                'loss_mask': torch.zeros(1, dtype=torch.bool)
-                            }
-                    
-                    except json.JSONDecodeError:
-                        return self.__getitem__((idx + 1) % self.total_length)
+                    if line:
+                        data.append(json.loads(line))
+        self.data = data
+        self.input_ids = []
+        self.loss_masks = []
         
-        # Should not reach here
-        raise RuntimeError(f"Could not find line {line_idx} in file {file_idx}")
+        for item in data:
+            self.input_ids.append(item['input_ids'])
+            self.loss_masks.append(item['loss_mask'])
+        
+        return
+
+    def __len__(self):
+        if hasattr(self, 'data'):
+            return len(self.data)
+        return len(self.prompts)
+
+    def __getitem__(self, item):
+        # If we're using the JSON data with pre-tokenized inputs
+        input_ids = torch.tensor(self.input_ids[item], dtype=torch.long)
+        attention_mask = torch.ones_like(input_ids, dtype=torch.long)
+        loss_mask = torch.tensor(self.loss_masks[item], dtype=torch.long)
+        
+        # Ensure the sequence is the right length
+
+        sequence_length = input_ids.shape[0]
+        assert sequence_length < self.max_length, f'{sequence_length=} is larger than {self.max_length=}'
+        
+        padded_input_ids = torch.ones(size=(self.max_length - sequence_length,),
+                                    dtype=input_ids.dtype) * self.tokenizer.pad_token_id
+        padded_attention_mask = torch.zeros(size=(self.max_length - sequence_length,), dtype=attention_mask.dtype)
+        padded_loss_mask = torch.zeros(size=(self.max_length - sequence_length,), dtype=attention_mask.dtype)
+
+        input_ids = torch.cat((input_ids, padded_input_ids))
+        attention_mask = torch.cat((attention_mask, padded_attention_mask))
+        loss_mask = torch.cat((loss_mask, padded_loss_mask))
+
+        position_ids = compute_position_id_with_mask(attention_mask)
 
 
-# Use the indexed version as the default since FSDP trainer expects __len__
-StreamingSFTDataset = IndexedStreamingDataset
+        return {
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+            'position_ids': position_ids,
+            'loss_mask': loss_mask
+        }
+        
+
+if __name__ == '__main__':
+    from transformers import AutoTokenizer
+    local_model_path = "FundamentalResearchLabs/xlam-hf60ktools-sft"
+
+    tokenizer = AutoTokenizer.from_pretrained(local_model_path, device_map="cuda", local_files_only=True)
+       # Set pad token if it doesn't exist
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    
+    # Load data from the distilled dataset
+    dataset = SFTDataset(parquet_files=["/home/ubuntu/sharedusmidwest1/tianhangzhu/data/preposttrain/distill_new_automator/processed_distilled_train_only_data_all_ntasks674_n4_max_length_16384_size_3211_train.jsonl"], 
+                         tokenizer=tokenizer,
+                         max_length=3000,
+                         truncation='right')
+
+
+    print("\nExample 0:")
+    sample = dataset[0]
+    for k, v in sample.items():
+        if isinstance(v, torch.Tensor):
+            print(f"{k}: shape={v.shape}, dtype={v.dtype}")
+
+    print(tokenizer.decode(sample['input_ids']))

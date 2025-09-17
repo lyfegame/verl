@@ -27,6 +27,8 @@ os.environ["TOKENIZERS_PARALLELISM"] = "true"
 import logging
 import re
 from contextlib import nullcontext
+import signal
+import faulthandler
 
 import hydra
 import torch
@@ -48,6 +50,7 @@ from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, get_
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset
 from verl.utils.dataset.streaming_sft_dataset_v2 import StreamingSFTDataset as StreamingSFTDatasetV2
+# from verl.utils.dataset.sft_dataset import SFTDataset as StreamingSFTDatasetV2
 from verl.utils.device import get_device_id, get_device_name, is_cuda_available, is_npu_available
 from verl.utils.distributed import destroy_global_process_group, initialize_global_process_group
 from verl.utils.fs import copy_to_local
@@ -84,6 +87,9 @@ logger.setLevel(os.getenv("VERL_SFT_LOGGING_LEVEL", "WARN"))
 
 import subprocess
 from pathlib import Path
+import threading
+import time
+from google.cloud import storage
 
 def print_flush(*args, **kwargs):
     """Print with immediate flush to ensure visibility"""
@@ -133,6 +139,92 @@ def extract_step(path):
     if match:
         return int(match.group(1))
     return None
+
+
+def upload_consolidated_checkpoint_to_gcs(consolidated_dir: Path, gcs_bucket: str, gcs_path: str, checkpoint_name: str) -> bool:
+    """Upload consolidated checkpoint directly to GCS."""
+    try:
+        # Initialize the GCS client
+        client = storage.Client()
+        bucket = client.bucket(gcs_bucket)
+        
+        # Get all files in the consolidated directory recursively
+        files_to_upload = list(consolidated_dir.rglob("*"))
+        files_to_upload = [f for f in files_to_upload if f.is_file()]
+        
+        print(f"[GCS_UPLOAD] Uploading {len(files_to_upload)} files from {consolidated_dir} to gs://{gcs_bucket}/{gcs_path}/{checkpoint_name}/")
+        
+        uploaded_count = 0
+        for file_path in files_to_upload:
+            # Calculate relative path from consolidated_dir
+            relative_path = file_path.relative_to(consolidated_dir)
+            
+            # Create the GCS blob path
+            blob_path = f"{gcs_path}/{checkpoint_name}/{relative_path}".replace("\\", "/")
+            
+            # Upload the file
+            blob = bucket.blob(blob_path)
+            try:
+                blob.upload_from_filename(str(file_path))
+                uploaded_count += 1
+                if uploaded_count % 10 == 0:  # Progress update every 10 files
+                    print(f"[GCS_UPLOAD] Uploaded {uploaded_count}/{len(files_to_upload)} files...")
+            except Exception as e:
+                print(f"[GCS_UPLOAD] Failed to upload {file_path}: {str(e)}")
+                return False
+        
+        print(f"[GCS_UPLOAD] ✓ Successfully uploaded {uploaded_count} files to gs://{gcs_bucket}/{gcs_path}/{checkpoint_name}/")
+        return True
+        
+    except Exception as e:
+        print(f"[GCS_UPLOAD] ✗ GCS upload failed: {str(e)}")
+        return False
+
+
+def consolidate_and_upload_checkpoint_thread(checkpoint_path: str, gcs_bucket: str, gcs_path: str, cleanup_temp: bool = True):
+    """
+    Thread function to consolidate FSDP checkpoint and upload to GCS.
+    This runs in a separate thread to avoid blocking the main training process.
+    """
+    thread_name = threading.current_thread().name
+    checkpoint_name = Path(checkpoint_path).name
+    
+    try:
+        print(f"[{thread_name}] Starting consolidation and upload for checkpoint: {checkpoint_name}")
+        
+        # Consolidate the checkpoint
+        print(f"[{thread_name}] Consolidating FSDP checkpoint: {checkpoint_path}")
+        consolidated_path = consolidate_fsdp_checkpoint(checkpoint_path)
+        consolidated_dir = Path(consolidated_path)
+        print(f"[{thread_name}] ✓ Consolidation completed: {consolidated_path}")
+        
+        # Upload to GCS
+        print(f"[{thread_name}] Starting GCS upload for: {checkpoint_name}")
+        success = upload_consolidated_checkpoint_to_gcs(
+            consolidated_dir,
+            gcs_bucket,
+            gcs_path,
+            checkpoint_name
+        )
+        
+        if success:
+            print(f"[{thread_name}] ✓ Successfully uploaded checkpoint: {checkpoint_name}")
+        else:
+            print(f"[{thread_name}] ✗ Failed to upload checkpoint: {checkpoint_name}")
+        
+        # Clean up temporary consolidated directory if requested
+        if cleanup_temp and consolidated_dir.name.endswith("_consolidated"):
+            print(f"[{thread_name}] Cleaning up temporary directory: {consolidated_dir}")
+            import shutil
+            shutil.rmtree(consolidated_dir)
+            print(f"[{thread_name}] ✓ Temporary directory cleaned up")
+        
+        print(f"[{thread_name}] ✓ Thread completed successfully for checkpoint: {checkpoint_name}")
+        
+    except Exception as e:
+        print(f"[{thread_name}] ✗ Thread failed for checkpoint {checkpoint_name}: {str(e)}")
+        import traceback
+        print(f"[{thread_name}] Traceback:\n{traceback.format_exc()}")
 
 
 class FSDPSFTTrainer:
@@ -426,102 +518,237 @@ class FSDPSFTTrainer:
 
     def _compute_loss_and_backward(self, batch, do_backward=True):
         """Compute loss with optional sequence parallelism and remove padding features"""
+        rank = self.device_mesh.get_rank()
         use_sp = self.use_remove_padding and self.config.ulysses_sequence_parallel_size > 1
-
+        
+        # Only print critical debug info to reduce log noise [[memory:7638745]]
+        if rank == 0 or use_sp:
+            print(f"[DEBUG_LOSS] Rank {rank}: Starting _compute_loss_and_backward, use_sp={use_sp}, do_backward={do_backward}")
+        
+        # Only debug batch contents on rank 0 to reduce verbosity [[memory:7638745]]
+        if rank == 0:
+            print(f"[DEBUG_LOSS] Rank {rank}: Batch keys: {batch.keys()}")
+            for key in batch.keys():
+                if hasattr(batch[key], 'shape'):
+                    print(f"[DEBUG_LOSS] Rank {rank}: batch['{key}'] shape: {batch[key].shape}, dtype: {batch[key].dtype}, device: {batch[key].device}")
+            
         # Move inputs to GPU and prepare loss mask
-        input_ids = batch["input_ids"].to(self.device_name)
-        attention_mask = batch["attention_mask"].to(self.device_name)
-        position_ids = batch["position_ids"].to(self.device_name)
-        loss_mask = batch.pop("loss_mask")[:, :-1].reshape(-1).to(self.device_name)
-        loss_fct = nn.CrossEntropyLoss(reduction="none")
+        try:
+            # Only print detailed debug on rank 0 to reduce log noise [[memory:7638745]]
+            if rank == 0:
+                print(f"[DEBUG_LOSS] Rank {rank}: Moving inputs to {self.device_name}")
+                
+            input_ids = batch["input_ids"].to(self.device_name)
+            attention_mask = batch["attention_mask"].to(self.device_name)
+            position_ids = batch["position_ids"].to(self.device_name)
+            loss_mask = batch.pop("loss_mask")[:, :-1].reshape(-1).to(self.device_name)
+            
+            if rank == 0:
+                print(f"[DEBUG_LOSS] Rank {rank}: Inputs moved - input_ids: {input_ids.shape}, attention_mask: {attention_mask.shape}")
+                print(f"[DEBUG_LOSS] Rank {rank}: loss_mask sum: {loss_mask.sum().item()}, mean: {loss_mask.float().mean().item()}")
+            
+            loss_fct = nn.CrossEntropyLoss(reduction="none")
+            
+        except Exception as e:
+            print(f"[ERROR] Rank {rank}: Failed to prepare batch data: {e}")
+            print(f"[ERROR] Rank {rank}: Exception type: {type(e).__name__}")
+            import traceback
+            print(f"[ERROR] Rank {rank}: Traceback:\n{traceback.format_exc()}")
+            raise
 
         # Context manager for sequence parallel if needed
         context = self.sharding_manager if use_sp else nullcontext()
-        with context, torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
-            if not use_sp:
-                # Standard forward pass without sequence parallel
-                labels = input_ids[:, 1:].contiguous()
-                output = self.fsdp_model(
-                    input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, use_cache=False
-                )
-                logits = output.logits
+        
+        try:
+            print(f"[DEBUG_LOSS] Rank {rank}: Entering autocast context")
+            with context, torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
+                if not use_sp:
+                    # Standard forward pass without sequence parallel
+                    print(f"[DEBUG_LOSS] Rank {rank}: Standard forward pass (no SP)")
+                    
+                    print(f"[DEBUG_LOSS] Rank {rank}: Creating labels from input_ids")
+                    labels = input_ids[:, 1:].contiguous()
+                    print(f"[DEBUG_LOSS] Rank {rank}: Labels shape: {labels.shape}, dtype: {labels.dtype}")
+                    
+                    # Check for any invalid values in inputs
+                    print(f"[DEBUG_LOSS] Rank {rank}: Checking for NaN/Inf in inputs...")
+                    if torch.isnan(input_ids).any():
+                        print(f"[ERROR] Rank {rank}: NaN detected in input_ids!")
+                    if torch.isinf(input_ids.float()).any():
+                        print(f"[ERROR] Rank {rank}: Inf detected in input_ids!")
+                    
+                    print(f"[DEBUG_LOSS] Rank {rank}: Input stats - min: {input_ids.min().item()}, max: {input_ids.max().item()}")
+                    print(f"[DEBUG_LOSS] Rank {rank}: Attention mask stats - sum: {attention_mask.sum().item()}, mean: {attention_mask.float().mean().item()}")
+                    print(f"[DEBUG_LOSS] Rank {rank}: Position IDs stats - min: {position_ids.min().item()}, max: {position_ids.max().item()}")
+                    
+                    print(f"[DEBUG_LOSS] Rank {rank}: Calling model forward pass...")
+                    print(f"[DEBUG_LOSS] Rank {rank}: GPU Memory before forward: Allocated={torch.cuda.memory_allocated()/(1024**3):.2f}GB, Reserved={torch.cuda.memory_reserved()/(1024**3):.2f}GB")
+                    
+                    output = self.fsdp_model(
+                        input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, use_cache=False
+                    )
+                    
+                    print(f"[DEBUG_LOSS] Rank {rank}: Forward pass completed")
+                    print(f"[DEBUG_LOSS] Rank {rank}: GPU Memory after forward: Allocated={torch.cuda.memory_allocated()/(1024**3):.2f}GB, Reserved={torch.cuda.memory_reserved()/(1024**3):.2f}GB")
+                    
+                    logits = output.logits
+                    print(f"[DEBUG_LOSS] Rank {rank}: Logits shape: {logits.shape}, dtype: {logits.dtype}")
+                    
+                    # Check for NaN/Inf in logits
+                    if torch.isnan(logits).any():
+                        print(f"[ERROR] Rank {rank}: NaN detected in logits!")
+                    if torch.isinf(logits).any():
+                        print(f"[ERROR] Rank {rank}: Inf detected in logits!")
 
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels.contiguous()
-                # Flatten the tokens
-                shift_logits = shift_logits.view(-1, self.model.config.vocab_size)
-                shift_labels = shift_labels.view(-1)
-                # Enable model parallelism
-                shift_labels = shift_labels.to(shift_logits.device)
-                loss = loss_fct(shift_logits, shift_labels)
-                loss = loss * loss_mask.to(loss.device)
-            else:
-                # IMPORTANT: We have a big assumption here, so we can shard the SAME sequence across SP ranks
-                # i.e., each GPU has <1 sequence, and each SP group has 1 sequence
-                # 1. All SP ranks will receive the *SAME* batch
-                # 2. Different SP groups will receive *DIFFERENT* batches
-                # This is implemented by the DistributedSampler
+                    print(f"[DEBUG_LOSS] Rank {rank}: Shifting logits and labels")
+                    shift_logits = logits[..., :-1, :].contiguous()
+                    shift_labels = labels.contiguous()
+                    print(f"[DEBUG_LOSS] Rank {rank}: Shift_logits shape: {shift_logits.shape}")
+                    print(f"[DEBUG_LOSS] Rank {rank}: Shift_labels shape: {shift_labels.shape}")
+                    
+                    # Flatten the tokens
+                    print(f"[DEBUG_LOSS] Rank {rank}: Flattening tokens")
+                    shift_logits = shift_logits.view(-1, self.model.config.vocab_size)
+                    shift_labels = shift_labels.view(-1)
+                    print(f"[DEBUG_LOSS] Rank {rank}: Flattened logits shape: {shift_logits.shape}")
+                    print(f"[DEBUG_LOSS] Rank {rank}: Flattened labels shape: {shift_labels.shape}")
+                    
+                    # Enable model parallelism
+                    print(f"[DEBUG_LOSS] Rank {rank}: Moving labels to logits device")
+                    shift_labels = shift_labels.to(shift_logits.device)
+                    
+                    print(f"[DEBUG_LOSS] Rank {rank}: Computing loss")
+                    loss = loss_fct(shift_logits, shift_labels)
+                    print(f"[DEBUG_LOSS] Rank {rank}: Raw loss shape: {loss.shape}, dtype: {loss.dtype}")
+                    
+                    print(f"[DEBUG_LOSS] Rank {rank}: Applying loss mask")
+                    loss = loss * loss_mask.to(loss.device)
+                    print(f"[DEBUG_LOSS] Rank {rank}: Masked loss computed")
+                else:
+                    # IMPORTANT: We have a big assumption here, so we can shard the SAME sequence across SP ranks
+                    # i.e., each GPU has <1 sequence, and each SP group has 1 sequence
+                    # 1. All SP ranks will receive the *SAME* batch
+                    # 2. Different SP groups will receive *DIFFERENT* batches
+                    # This is implemented by the DistributedSampler
+                    
+                    print(f"[DEBUG_LOSS] Rank {rank}: Using sequence parallel (SP) path")
+                    
+                    batch_size, seqlen = input_ids.shape
+                    print(f"[DEBUG_LOSS] Rank {rank}: SP batch_size={batch_size}, seqlen={seqlen}")
+                    
+                    # Remove padding
+                    print(f"[DEBUG_LOSS] Rank {rank}: Unpacking input with flash attention utilities")
+                    try:
+                        input_ids_rmpad, indices, *_ = unpad_input(
+                            input_ids.unsqueeze(-1), attention_mask
+                        )  # input_ids_rmpad (total_nnz, ...)
+                        print(f"[DEBUG_LOSS] Rank {rank}: Unpacked input_ids_rmpad shape: {input_ids_rmpad.shape}")
+                        print(f"[DEBUG_LOSS] Rank {rank}: Indices shape: {indices.shape if hasattr(indices, 'shape') else type(indices)}")
+                        
+                        input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
+                        print(f"[DEBUG_LOSS] Rank {rank}: Transposed input_ids_rmpad shape: {input_ids_rmpad.shape}")
+                    except Exception as e:
+                        print(f"[ERROR] Rank {rank}: Failed to unpad input: {e}")
+                        print(f"[ERROR] Rank {rank}: input_ids shape: {input_ids.shape}, attention_mask shape: {attention_mask.shape}")
+                        raise
 
-                batch_size, seqlen = input_ids.shape
-                # Remove padding
-                input_ids_rmpad, indices, *_ = unpad_input(
-                    input_ids.unsqueeze(-1), attention_mask
-                )  # input_ids_rmpad (total_nnz, ...)
-                input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
+                    # Unpad position_ids to align rotary
+                    position_ids_rmpad = index_first_axis(
+                        rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices
+                    ).transpose(0, 1)
 
-                # Unpad position_ids to align rotary
-                position_ids_rmpad = index_first_axis(
-                    rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices
-                ).transpose(0, 1)
+                    # Pad and slice inputs for sequence parallelism
+                    input_ids_rmpad_sliced, position_ids_rmpad_padded, pad_size = ulysses_pad_and_slice_inputs(
+                        input_ids_rmpad, position_ids_rmpad, sp_size=get_ulysses_sequence_parallel_world_size()
+                    )
+                    # For computing loss
+                    input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)  # (1, total_nnz)
+                    input_ids_rmpad_rolled, _, _ = ulysses_pad_and_slice_inputs(
+                        input_ids_rmpad_rolled, None, get_ulysses_sequence_parallel_world_size()
+                    )
+                    input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)  # ((total_nnz / sp) + pad)
 
-                # Pad and slice inputs for sequence parallelism
-                input_ids_rmpad_sliced, position_ids_rmpad_padded, pad_size = ulysses_pad_and_slice_inputs(
-                    input_ids_rmpad, position_ids_rmpad, sp_size=get_ulysses_sequence_parallel_world_size()
-                )
-                # For computing loss
-                input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)  # (1, total_nnz)
-                input_ids_rmpad_rolled, _, _ = ulysses_pad_and_slice_inputs(
-                    input_ids_rmpad_rolled, None, get_ulysses_sequence_parallel_world_size()
-                )
-                input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)  # ((total_nnz / sp) + pad)
+                    # Forward pass
+                    output = self.fsdp_model(
+                        input_ids=input_ids_rmpad_sliced,
+                        attention_mask=None,  # Not needed with flash attention varlen
+                        position_ids=position_ids_rmpad_padded,
+                        use_cache=False,
+                    )
 
-                # Forward pass
-                output = self.fsdp_model(
-                    input_ids=input_ids_rmpad_sliced,
-                    attention_mask=None,  # Not needed with flash attention varlen
-                    position_ids=position_ids_rmpad_padded,
-                    use_cache=False,
-                )
+                    # Compute loss locally then aggregate
+                    logits_rmpad = output.logits.squeeze(0)
+                    input_ids_rmpad_rolled = input_ids_rmpad_rolled.to(logits_rmpad.device)
+                    loss = loss_fct(logits_rmpad, input_ids_rmpad_rolled)
+                    # Gather and unpad for sequence parallelism
+                    loss = gather_outputs_and_unpad(loss, gather_dim=0, unpad_dim=0, padding_size=pad_size)
 
-                # Compute loss locally then aggregate
-                logits_rmpad = output.logits.squeeze(0)
-                input_ids_rmpad_rolled = input_ids_rmpad_rolled.to(logits_rmpad.device)
-                loss = loss_fct(logits_rmpad, input_ids_rmpad_rolled)
-                # Gather and unpad for sequence parallelism
-                loss = gather_outputs_and_unpad(loss, gather_dim=0, unpad_dim=0, padding_size=pad_size)
+                    # This is the loss collected from all ulysses ranks
+                    full_loss = pad_input(
+                        hidden_states=loss.unsqueeze(-1), indices=indices, batch=batch_size, seqlen=seqlen
+                    )
+                    full_loss = full_loss.squeeze(-1)[:, :-1]  # Remove last token's loss
+                    full_loss = full_loss.reshape(-1)
+                    loss_mask = loss_mask.to(full_loss.device)
+                    loss = full_loss * loss_mask
 
-                # This is the loss collected from all ulysses ranks
-                full_loss = pad_input(
-                    hidden_states=loss.unsqueeze(-1), indices=indices, batch=batch_size, seqlen=seqlen
-                )
-                full_loss = full_loss.squeeze(-1)[:, :-1]  # Remove last token's loss
-                full_loss = full_loss.reshape(-1)
-                loss_mask = loss_mask.to(full_loss.device)
-                loss = full_loss * loss_mask
+                print(f"[DEBUG_LOSS] Rank {rank}: Computing valid tokens this rank")
+                valid_token_this_rank = torch.sum(loss_mask)
+                print(f"[DEBUG_LOSS] Rank {rank}: Valid tokens: {valid_token_this_rank.item()}")
 
-            valid_token_this_rank = torch.sum(loss_mask)
+                if self.config.data.balance_dp_token:
+                    print(f"[DEBUG_LOSS] Rank {rank}: Balancing DP tokens - doing all_reduce")
+                    torch.distributed.all_reduce(valid_token_this_rank)
+                    dp_size = self.ulysses_device_mesh.size("dp") if use_sp else torch.distributed.get_world_size()
+                    print(f"[DEBUG_LOSS] Rank {rank}: After all_reduce, valid_tokens={valid_token_this_rank.item()}, dp_size={dp_size}")
+                else:
+                    dp_size = 1
+                    print(f"[DEBUG_LOSS] Rank {rank}: Not balancing DP tokens, dp_size=1")
 
-            if self.config.data.balance_dp_token:
-                torch.distributed.all_reduce(valid_token_this_rank)
-                dp_size = self.ulysses_device_mesh.size("dp") if use_sp else torch.distributed.get_world_size()
-            else:
-                dp_size = 1
+                print(f"[DEBUG_LOSS] Rank {rank}: Computing final loss")
+                loss = torch.sum(loss) / (valid_token_this_rank + 1e-8) * dp_size
+                print(f"[DEBUG_LOSS] Rank {rank}: Final loss value: {loss.item():.6f}")
+            
+                # Check for NaN/Inf in final loss
+                if torch.isnan(loss):
+                    print(f"[ERROR] Rank {rank}: NaN detected in final loss!")
+                if torch.isinf(loss):
+                    print(f"[ERROR] Rank {rank}: Inf detected in final loss!")
 
-            loss = torch.sum(loss) / (valid_token_this_rank + 1e-8) * dp_size
-
-            if do_backward:
-                loss.backward()
-            return loss
+                if do_backward:
+                    print(f"[DEBUG_LOSS] Rank {rank}: Starting backward pass")
+                    print(f"[DEBUG_LOSS] Rank {rank}: GPU Memory before backward: Allocated={torch.cuda.memory_allocated()/(1024**3):.2f}GB, Reserved={torch.cuda.memory_reserved()/(1024**3):.2f}GB")
+                    loss.backward()
+                    print(f"[DEBUG_LOSS] Rank {rank}: Backward pass completed")
+                    print(f"[DEBUG_LOSS] Rank {rank}: GPU Memory after backward: Allocated={torch.cuda.memory_allocated()/(1024**3):.2f}GB, Reserved={torch.cuda.memory_reserved()/(1024**3):.2f}GB")
+                    
+                print(f"[DEBUG_LOSS] Rank {rank}: _compute_loss_and_backward completed successfully")
+                return loss
+        except Exception as e:
+            print(f"[ERROR] Rank {rank}: Exception in _compute_loss_and_backward: {e}")
+            print(f"[ERROR] Rank {rank}: Exception type: {type(e).__name__}")
+            import traceback
+            print(f"[ERROR] Rank {rank}: Traceback:\n{traceback.format_exc()}")
+            
+            # Try to print some debug info about where we are
+            print(f"[ERROR] Rank {rank}: Current state debug:")
+            if 'loss' in locals():
+                print(f"[ERROR] Rank {rank}: Loss exists, shape: {loss.shape if hasattr(loss, 'shape') else 'scalar'}")
+            if 'shift_logits' in locals():
+                print(f"[ERROR] Rank {rank}: shift_logits exists, shape: {shift_logits.shape}")
+            if 'shift_labels' in locals():
+                print(f"[ERROR] Rank {rank}: shift_labels exists, shape: {shift_labels.shape}")
+            
+            # Synchronize error state across ranks before raising
+            print(f"[ERROR] Rank {rank}: Synchronizing error state across all ranks")
+            try:
+                error_tensor = torch.tensor(1.0).to(self.device_name)
+                torch.distributed.all_reduce(error_tensor, op=torch.distributed.ReduceOp.SUM)
+                print(f"[ERROR] Rank {rank}: Total ranks with errors: {error_tensor.item()}")
+            except Exception as sync_err:
+                print(f"[ERROR] Rank {rank}: Failed to sync error state: {sync_err}")
+            
+            raise
 
     def training_step(self, batch: TensorDict):
         rank = self.device_mesh.get_rank()
@@ -536,22 +763,79 @@ class FSDPSFTTrainer:
 
         log_gpu_memory_usage("After optimizer zero_grad", logger=logger)
 
+        print(f"[TRAIN_STEP] Rank {rank}: Splitting batch into micro-batches")
+        print(f"[TRAIN_STEP] Rank {rank}: Batch size before split: {batch.batch_size if hasattr(batch, 'batch_size') else 'N/A'}")
+        print(f"[TRAIN_STEP] Rank {rank}: Micro batch size per GPU: {self.config.data.micro_batch_size_per_gpu}")
+        
         micro_batches = batch.split(self.config.data.micro_batch_size_per_gpu)
         n_micro_batches = len(micro_batches)
         
-        if rank == 0:
-            print(f"[TRAIN_STEP] Processing {n_micro_batches} micro-batches")
+        print(f"[TRAIN_STEP] Rank {rank}: Processing {n_micro_batches} micro-batches")
             
         step_loss = 0
         for i, micro_batch in enumerate(micro_batches):
-            if rank == 0:
-                print(f"[MICRO_BATCH] Processing micro-batch {i+1}/{n_micro_batches}")
-                
-            loss = self._compute_loss_and_backward(batch=micro_batch) / n_micro_batches
-            step_loss += loss.item()
+            print(f"[MICRO_BATCH] Rank {rank}: Starting micro-batch {i+1}/{n_micro_batches}")
             
-            if rank == 0:
-                print(f"[MICRO_BATCH] Micro-batch {i+1} loss: {loss.item():.4f}")
+            # Print detailed micro-batch info
+            if hasattr(micro_batch, 'keys'):
+                print(f"[MICRO_BATCH] Rank {rank}: Micro-batch {i+1} keys: {micro_batch.keys()}")
+                for key in micro_batch.keys():
+                    if hasattr(micro_batch[key], 'shape'):
+                        print(f"[MICRO_BATCH] Rank {rank}: Micro-batch {i+1} - {key}: shape={micro_batch[key].shape}, dtype={micro_batch[key].dtype}")
+                        
+                        # Extra debug for batch 46 (where the crash occurred)
+                        if i >= 44:  # micro-batches 45, 46, 47...
+                            print(f"[CRITICAL_DEBUG] Rank {rank}: NEAR CRASH POINT - Micro-batch {i+1}")
+                            if key == "input_ids":
+                                print(f"[CRITICAL_DEBUG] Rank {rank}: input_ids min={micro_batch[key].min().item()}, max={micro_batch[key].max().item()}")
+                                print(f"[CRITICAL_DEBUG] Rank {rank}: input_ids first 10 tokens: {micro_batch[key][0, :10].tolist() if micro_batch[key].shape[0] > 0 else 'empty'}")
+                            elif key == "attention_mask":
+                                print(f"[CRITICAL_DEBUG] Rank {rank}: attention_mask sum={micro_batch[key].sum().item()}")
+                            elif key == "position_ids":
+                                print(f"[CRITICAL_DEBUG] Rank {rank}: position_ids min={micro_batch[key].min().item()}, max={micro_batch[key].max().item()}")
+                            elif key == "loss_mask":
+                                print(f"[CRITICAL_DEBUG] Rank {rank}: loss_mask sum={micro_batch[key].sum().item()}")
+                
+            try:
+                print(f"[MICRO_BATCH] Rank {rank}: Computing loss for micro-batch {i+1}")
+                loss = self._compute_loss_and_backward(batch=micro_batch) / n_micro_batches
+                
+                print(f"[MICRO_BATCH] Rank {rank}: Micro-batch {i+1} loss computed: {loss.item():.4f}")
+                
+                # Check for anomalies
+                if torch.isnan(loss):
+                    print(f"[ERROR] Rank {rank}: NaN loss detected in micro-batch {i+1}")
+                if torch.isinf(loss):
+                    print(f"[ERROR] Rank {rank}: Inf loss detected in micro-batch {i+1}")
+                if loss.item() < 0:
+                    print(f"[WARNING] Rank {rank}: Negative loss detected in micro-batch {i+1}: {loss.item()}")
+                
+                step_loss += loss.item()
+                
+                print(f"[MICRO_BATCH] Rank {rank}: Micro-batch {i+1} completed successfully, accumulated step_loss={step_loss:.4f}")
+                
+                # Clear GPU cache periodically to prevent memory issues
+                if torch.cuda.is_available() and i % 10 == 0:
+                    torch.cuda.empty_cache()
+                    print(f"[MICRO_BATCH] Rank {rank}: GPU cache cleared at micro-batch {i+1}")
+                
+            except Exception as e:
+                print(f"[ERROR] Rank {rank}: Exception in micro-batch {i+1}: {e}")
+                print(f"[ERROR] Rank {rank}: Exception type: {type(e).__name__}")
+                import traceback
+                print(f"[ERROR] Rank {rank}: Traceback:\n{traceback.format_exc()}")
+                
+                # Synchronize all ranks before raising to prevent collective mismatch
+                print(f"[ERROR] Rank {rank}: Broadcasting exception to all ranks to maintain sync")
+                try:
+                    # Create a tensor to signal error state
+                    error_signal = torch.tensor(1.0).to(self.device_name)
+                    torch.distributed.all_reduce(error_signal, op=torch.distributed.ReduceOp.SUM)
+                    print(f"[ERROR] Rank {rank}: Error synchronized across ranks, total errors: {error_signal.item()}")
+                except Exception as sync_error:
+                    print(f"[ERROR] Rank {rank}: Failed to synchronize error state: {sync_error}")
+                
+                raise
 
         if rank == 0:
             print(f"[TRAIN_STEP] Computing gradients and clipping")
@@ -780,7 +1064,27 @@ class FSDPSFTTrainer:
                         else:
                             raise
 
-                # Copy to HDFS if configured
+                # Spawn background thread for consolidation and GCS upload (only on rank 0)
+                if self.device_mesh.get_rank() == 0:
+                    # Extract the experiment name from the local directory path for GCS path
+                    experiment_name = Path(self.config.trainer.default_local_dir).name
+                    gcs_path = f"home/tianhangzhu/output_new/{experiment_name}"
+                    gcs_bucket = "training-tianhang"
+                    
+                    print(f"[CHECKPOINT] Spawning background thread for consolidation and GCS upload")
+                    print(f"[CHECKPOINT] GCS path: gs://{gcs_bucket}/{gcs_path}/global_step_{step}")
+                    
+                    # Create and start the background thread
+                    upload_thread = threading.Thread(
+                        target=consolidate_and_upload_checkpoint_thread,
+                        args=(local_global_step_folder, gcs_bucket, gcs_path, True),  # cleanup_temp=True
+                        name=f"CheckpointUpload-{step}",
+                        daemon=True  # Thread will not prevent program exit
+                    )
+                    upload_thread.start()
+                    print(f"[CHECKPOINT] Background thread started for step {step}")
+                
+                # Copy to HDFS if configured (keep existing HDFS functionality)
                 if self.device_mesh.get_rank() == 0 and getattr(self.config.trainer, "default_hdfs_dir", None):
                     try:
                         hdfs_io.makedirs(self.config.trainer.default_hdfs_dir, exist_ok=True)
@@ -789,15 +1093,10 @@ class FSDPSFTTrainer:
                         print(f"Warning: Failed to copy to HDFS: {e}")
                         # Continue even if HDFS copy fails
                 
-                # Consolidate checkpoint
-                if self.device_mesh.get_rank() == 0:
-                    print(f"[CHECKPOINT] Starting FSDP consolidation for step {step}")
-                    consolidate_fsdp_checkpoint(local_global_step_folder)
-                    print(f"[CHECKPOINT] FSDP consolidation completed for step {step}")
-                
-                print(f"[CHECKPOINT] Rank {self.device_mesh.get_rank()}: Waiting at post-save barrier for step {step}")
+                # Final barrier to ensure all operations complete
+                print(f"[CHECKPOINT] Rank {self.device_mesh.get_rank()}: Waiting at final post-save barrier for step {step}")
                 torch.distributed.barrier()
-                print(f"[CHECKPOINT] Rank {self.device_mesh.get_rank()}: Passed post-save barrier for step {step}")
+                print(f"[CHECKPOINT] Rank {self.device_mesh.get_rank()}: Passed final post-save barrier for step {step}")
                 
                 # Successfully saved checkpoint, break out of retry loop
                 if self.device_mesh.get_rank() == 0:
@@ -1039,7 +1338,43 @@ class FSDPSFTTrainer:
                         print(f"[TRAIN_LOOP] Rank {rank}: GPU memory: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
                 
                 print(f"[TRAIN_LOOP] Rank {rank}: Converting batch to TensorDict for step {global_step}")
-                data = TensorDict(data, batch_size=self.config.data.train_batch_size).to(self.device_name)
+                
+                # Validate data before conversion
+                if data is None:
+                    print(f"[ERROR] Rank {rank}: Data is None at step {global_step}")
+                    raise ValueError(f"Data is None at step {global_step}")
+                    
+                # Print raw data info
+                print(f"[TRAIN_LOOP] Rank {rank}: Raw data type: {type(data)}")
+                if isinstance(data, dict):
+                    print(f"[TRAIN_LOOP] Rank {rank}: Raw data keys: {data.keys()}")
+                    for key, val in data.items():
+                        if hasattr(val, 'shape'):
+                            print(f"[TRAIN_LOOP] Rank {rank}: data['{key}'] shape: {val.shape}, dtype: {val.dtype}")
+                            # Check for empty tensors
+                            if val.numel() == 0:
+                                print(f"[WARNING] Rank {rank}: Empty tensor found for key '{key}'")
+                            # Check for invalid values
+                            if key == "input_ids" and (val.min() < 0 or val.max() >= 200000):  # Assuming vocab size < 200k
+                                print(f"[WARNING] Rank {rank}: Invalid input_ids range: min={val.min()}, max={val.max()}")
+                
+                try:
+                    data = TensorDict(data, batch_size=self.config.data.train_batch_size)
+                    print(f"[TRAIN_LOOP] Rank {rank}: TensorDict created successfully")
+                    
+                    # Check TensorDict contents
+                    print(f"[TRAIN_LOOP] Rank {rank}: TensorDict batch_size: {data.batch_size}")
+                    print(f"[TRAIN_LOOP] Rank {rank}: TensorDict keys: {data.keys()}")
+                    
+                    data = data.to(self.device_name)
+                    print(f"[TRAIN_LOOP] Rank {rank}: TensorDict moved to {self.device_name}")
+                    
+                except Exception as e:
+                    print(f"[ERROR] Rank {rank}: Failed to create/move TensorDict at step {global_step}: {e}")
+                    print(f"[ERROR] Rank {rank}: Exception type: {type(e).__name__}")
+                    import traceback
+                    print(f"[ERROR] Rank {rank}: Traceback:\n{traceback.format_exc()}")
+                    raise
                 
                 print(f"[TRAIN_LOOP] Rank {rank}: Calling training_step for step {global_step}")
                 metric = self.training_step(data)
@@ -1108,6 +1443,33 @@ def run_sft(config):
     print(f"[DEBUG] Max length: {config.data.get('max_length', 'not set')}")
     print(f"[DEBUG] Train batch size: {config.data.get('train_batch_size', 'not set')}")
     print(f"[DEBUG] Micro batch size: {config.data.get('micro_batch_size_per_gpu', 'not set')}")
+    
+    # Enable fault handler to catch segmentation faults
+    faulthandler.enable()
+    print(f"[DEBUG] Fault handler enabled for better error tracking")
+    
+    # Set up signal handler for SIGSEGV
+    def handle_sigsegv(signum, frame):
+        print(f"\n[CRITICAL ERROR] Segmentation fault (SIGSEGV) caught!")
+        print(f"[CRITICAL ERROR] Signal number: {signum}")
+        print(f"[CRITICAL ERROR] Frame info: {frame}")
+        
+        # Try to print GPU memory state
+        if torch.cuda.is_available():
+            try:
+                print(f"[CRITICAL ERROR] GPU memory at crash:")
+                print(f"  Allocated: {torch.cuda.memory_allocated()/(1024**3):.2f} GB")
+                print(f"  Reserved: {torch.cuda.memory_reserved()/(1024**3):.2f} GB")
+                print(f"  Max allocated: {torch.cuda.max_memory_allocated()/(1024**3):.2f} GB")
+            except:
+                print(f"[CRITICAL ERROR] Could not get GPU memory info")
+        
+        # Re-raise to get the default behavior
+        signal.signal(signal.SIGSEGV, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGSEGV)
+    
+    signal.signal(signal.SIGSEGV, handle_sigsegv)
+    print(f"[DEBUG] SIGSEGV handler installed")
     
     device_name = get_device_name()
     print(f"[DEBUG] Device: {device_name}")
@@ -1184,50 +1546,24 @@ def create_sft_dataset(data_paths, data_config, tokenizer):
         num_workers = min(64, max(1, total_cpus - 5))  # Cap at 64, leave 5 CPUs free
         print(f"[DEBUG] System has {total_cpus} CPUs, auto-using {num_workers} workers for dataset indexing")
     
-    # build dataset
-    # First check if a custom dataset class is specified
-    if data_config.custom_cls.get("path", None):
-        from verl.utils.import_utils import load_extern_type
-        print(f"[DEBUG] Loading custom dataset class from {data_config.custom_cls.path}")
-        dataset_cls = load_extern_type(data_config.custom_cls.path, data_config.custom_cls.name)
-    # Then check if multi-turn dataset should be used
-    elif data_config.get("multiturn", {}).get("enable", False):
-        print(f"[DEBUG] Using MultiTurnSFTDataset")
-        dataset_cls = MultiTurnSFTDataset
-    # Always use StreamingSFTDatasetV2 for regular datasets (memory efficient)
-    else:
-        dataset_cls = StreamingSFTDatasetV2
-        print(f"[DEBUG] Using StreamingSFTDatasetV2 for memory-efficient loading")
-        print(f"[DEBUG] Max length: {data_config.get('max_length', 1024)}")
-        print(f"[DEBUG] Truncation: {data_config.get('truncation', 'error')}")
+    dataset_cls = StreamingSFTDatasetV2
+    print(f"[DEBUG] Using StreamingSFTDatasetV2 for memory-efficient loading")
+    print(f"[DEBUG] Max length: {data_config.get('max_length', 1024)}")
+    print(f"[DEBUG] Truncation: {data_config.get('truncation', 'error')}")
 
     # Create datasets based on the selected class
     print(f"[DEBUG] Creating dataset with class: {dataset_cls.__name__}")
     
-    if dataset_cls == StreamingSFTDatasetV2:
-        # StreamingSFTDatasetV2 with parallel indexing
-        dataset = dataset_cls(
-            parquet_files=data_paths,
-            tokenizer=tokenizer,
-            max_length=data_config.get('max_length', 1024),
-            truncation=data_config.get('truncation', 'error'),
-            num_workers=num_workers  # Use auto-detected number of workers
-        )
-    elif dataset_cls == MultiTurnSFTDataset:
-        # MultiTurnSFTDataset uses config
-        dataset = dataset_cls(parquet_files=data_paths, tokenizer=tokenizer, config=data_config)
-    else:
-        # Custom dataset classes might accept config
-        try:
-            dataset = dataset_cls(parquet_files=data_paths, tokenizer=tokenizer, config=data_config)
-        except:
-            # Fall back to SFTDataset interface
-            dataset = dataset_cls(
-                parquet_files=data_paths,
-                tokenizer=tokenizer,
-                max_length=data_config.get('max_length', 1024),
-                truncation=data_config.get('truncation', 'error')
-            )
+    assert dataset_cls == StreamingSFTDatasetV2, "Only StreamingSFTDatasetV2 is supported for memory-efficient loading"
+    # StreamingSFTDatasetV2 with parallel indexing
+    dataset = dataset_cls(
+        parquet_files=data_paths,
+        tokenizer=tokenizer,
+        max_length=data_config.get('max_length', 1024),
+        truncation=data_config.get('truncation', 'error'),
+        # num_workers=num_workers  # Use auto-detected number of workers
+    )
+    
     
     print(f"[DEBUG] Dataset created successfully, length: {len(dataset)}")
     return dataset

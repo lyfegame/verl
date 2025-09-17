@@ -42,6 +42,7 @@ install_requires = [
     "wandb",
     "packaging>=20.0",
     "tensorboard",
+    "google-cloud-storage",
 ]
 
 TEST_REQUIRES = ["pytest", "pre-commit", "py-spy", "pytest-asyncio"]
