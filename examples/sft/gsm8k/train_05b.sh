@@ -13,6 +13,7 @@ export NCCL_ASYNC_ERROR_HANDLING=1
 export NCCL_DEBUG=INFO  # Enable NCCL debug logging
 export NCCL_DEBUG_SUBSYS=ALL  # Debug all NCCL subsystems
 export TORCH_DISTRIBUTED_DEBUG=DETAIL  # PyTorch distributed debug
+export CC=/usr/bin/gcc
 
 # CUDA debugging
 export CUDA_LAUNCH_BLOCKING=0  # Set to 1 for synchronous execution (slower but better error messages)

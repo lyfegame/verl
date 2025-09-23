@@ -18,6 +18,9 @@ export TORCH_DISTRIBUTED_DEBUG=DETAIL  # PyTorch distributed debug
 export CUDA_LAUNCH_BLOCKING=0  # Set to 1 for synchronous execution (slower but better error messages)
 export TORCH_CUDA_ARCH_LIST="8.0;8.9;9.0"  # H200 compatibility
 
+# C compiler for Triton compilation
+export CC=/usr/bin/gcc
+
 # Memory management
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512,garbage_collection_threshold:0.8
 export TORCH_CUDNN_V8_API_ENABLED=1
