@@ -282,7 +282,7 @@ class StreamingSFTDataset(Dataset):
         # Ensure the sequence is the right length
 
         sequence_length = input_ids.shape[0]
-        assert sequence_length < self.max_length, f'{sequence_length=} is larger than {self.max_length=}'
+        assert sequence_length <= self.max_length, f'{sequence_length=} is larger than {self.max_length=}'
         
         padded_input_ids = torch.ones(size=(self.max_length - sequence_length,),
                                     dtype=input_ids.dtype) * self.tokenizer.pad_token_id
